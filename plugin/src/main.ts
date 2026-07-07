@@ -28,11 +28,17 @@ interface OtaSettings {
   bridgeFilePath: string;
   /** Convert internal/wiki links to plain text (their targets are dead in Anki). */
   unwrapWikilinks: boolean;
+  /**
+   * When the target note has a "source" field, append the Obsidian URL of the current
+   * note to it (on a new line). Only applies to notes that actually have such a field.
+   */
+  appendSourceLink: boolean;
 }
 
 const DEFAULT_SETTINGS: OtaSettings = {
   bridgeFilePath: "",
   unwrapWikilinks: true,
+  appendSourceLink: true,
 };
 
 function defaultBridgeFile(): string {
@@ -86,12 +92,28 @@ export default class ObsidianToAnkiPlugin extends Plugin {
       return;
     }
 
+    const sourceUrl = this.settings.appendSourceLink ? this.obsidianUrlFor(view) : null;
+
     try {
-      await this.postToBridge(html);
+      await this.postToBridge(html, sourceUrl);
       new Notice("Obsidian → Anki: sent.");
     } catch (err) {
       new Notice(`Obsidian → Anki: send failed — ${errorMessage(err)}`);
     }
+  }
+
+  /**
+   * The `obsidian://open` URL that reopens the current note in this vault. Handed to the
+   * bridge so it can drop it into the note's "source" field when one exists. Returns null
+   * if there's no backing file (e.g. an unsaved scratch view).
+   */
+  private obsidianUrlFor(view: MarkdownView): string | null {
+    const path = view?.file?.path;
+    if (!path) return null;
+    // encodeURIComponent (not URLSearchParams) so spaces become %20, not "+" — Obsidian's
+    // URI handler decodes with decodeURIComponent and would leave a literal "+" in the path.
+    const vault = encodeURIComponent(this.app.vault.getName());
+    return `obsidian://open?vault=${vault}&file=${encodeURIComponent(path)}`;
   }
 
   private async renderSelection(markdown: string, view: MarkdownView): Promise<string> {
@@ -253,11 +275,15 @@ export default class ObsidianToAnkiPlugin extends Plugin {
     return { url: parsed.url, token: parsed.token };
   }
 
-  private async postToBridge(html: string): Promise<void> {
+  private async postToBridge(html: string, sourceUrl: string | null): Promise<void> {
     const bridge = this.readBridgeInfo();
+    // The bridge appends this to the note's "source" field if it has one; a note without
+    // that field simply ignores it, so it's safe to always send.
+    const url = new URL(bridge.url);
+    if (sourceUrl) url.searchParams.set("source_url", sourceUrl);
     // requestUrl runs outside the renderer's fetch, so it isn't subject to CORS.
     const response = await requestUrl({
-      url: bridge.url,
+      url: url.toString(),
       method: "POST",
       headers: {
         Authorization: `Bearer ${bridge.token}`,
@@ -370,6 +396,19 @@ class OtaSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.unwrapWikilinks).onChange(async (value) => {
           this.plugin.settings.unwrapWikilinks = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Append source link")
+      .setDesc(
+        "When the target note has a \"source\" field, append this note's obsidian:// URL to " +
+          "it (on a new line). Notes without a source field are unaffected.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.appendSourceLink).onChange(async (value) => {
+          this.plugin.settings.appendSourceLink = value;
           await this.plugin.saveSettings();
         }),
       );
