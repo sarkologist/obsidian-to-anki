@@ -13,6 +13,7 @@ import {
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
 
 /**
  * Milestone M1: send the current Markdown selection into the focused Anki editor
@@ -90,15 +91,41 @@ export default class ObsidianToAnkiPlugin extends Plugin {
   }
 
   private async renderSelection(markdown: string, view: MarkdownView): Promise<string> {
+    // Pull math out before rendering so the LaTeX survives (Obsidian would otherwise render
+    // it to MathJax glyphs and Anki would receive empty <anki-mathjax> elements).
+    const { processed, math } = extractMath(markdown);
+
     const container = document.createElement("div");
     const component = new Component();
     // sourcePath lets Obsidian resolve embeds/wikilinks relative to the current note.
     const sourcePath = view?.file?.path ?? "";
     try {
-      await MarkdownRenderer.render(this.app, markdown, container, sourcePath, component);
+      await MarkdownRenderer.render(this.app, processed, container, sourcePath, component);
+      this.restoreMath(container, math);
       return container.innerHTML;
     } finally {
       component.unload();
+    }
+  }
+
+  /** Swap each math placeholder for the Anki delimiter form of its LaTeX. */
+  private restoreMath(container: HTMLElement, math: ReturnType<typeof extractMath>["math"]): void {
+    const placeholders = container.querySelectorAll(`[${MATH_PLACEHOLDER_ATTR}]`);
+    let missing = 0;
+    placeholders.forEach((el) => {
+      const idx = Number(el.getAttribute(MATH_PLACEHOLDER_ATTR));
+      const token = math[idx];
+      if (!token) {
+        missing += 1;
+        return;
+      }
+      el.replaceWith(document.createTextNode(delimit(token)));
+    });
+    if (placeholders.length < math.length) {
+      // Some placeholders were dropped by the renderer — warn rather than silently lose math.
+      new Notice(
+        `Obsidian → Anki: ${math.length - placeholders.length + missing} math block(s) may have been lost in rendering.`,
+      );
     }
   }
 
