@@ -277,16 +277,15 @@ export default class ObsidianToAnkiPlugin extends Plugin {
    * data-* / aria-* attributes that only mean something inside Obsidian.
    */
   private cleanupForAnki(container: HTMLElement): void {
-    // Links first (uses href/class before we strip them).
-    container.querySelectorAll("a").forEach((a) => {
-      const href = a.getAttribute("href") ?? "";
-      const external = /^(https?|mailto):/i.test(href);
-      if (!external && this.settings.unwrapWikilinks) {
-        a.replaceWith(document.createTextNode(a.textContent ?? ""));
-      } else if (external) {
-        a.setAttribute("href", href);
-      }
-    });
+    // Links first (keys off Obsidian's internal-link class, before we strip classes).
+    // Only internal/wiki links are unwrapped; every real external scheme (http, mailto,
+    // zotero://, tel:, …) is left as a link. Unwrap by moving the anchor's children out
+    // rather than flattening to text, so nested images/formatting survive.
+    if (this.settings.unwrapWikilinks) {
+      container.querySelectorAll("a.internal-link").forEach((a) => {
+        a.replaceWith(...Array.from(a.childNodes));
+      });
+    }
 
     // Remove Obsidian-only attributes everywhere; keep href/src/style and structure.
     container.querySelectorAll("*").forEach((el) => {
