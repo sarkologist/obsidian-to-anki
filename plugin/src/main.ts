@@ -2,6 +2,7 @@ import {
   App,
   Component,
   Editor,
+  FileSystemAdapter,
   MarkdownRenderer,
   MarkdownView,
   Notice,
@@ -12,7 +13,7 @@ import {
 } from "obsidian";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
 import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
 
 /**
@@ -122,15 +123,19 @@ export default class ObsidianToAnkiPlugin extends Plugin {
    */
   private async processImages(container: HTMLElement, sourcePath: string): Promise<void> {
     const embeds = Array.from(container.querySelectorAll<HTMLElement>(".image-embed[src]"));
-    const plainImgs = Array.from(container.querySelectorAll("img")).filter(
+    const hasPlainCandidate = Array.from(container.querySelectorAll("img")).some(
       (img) => localPathFromSrc(img.getAttribute("src")) !== null,
     );
-    if (embeds.length === 0 && plainImgs.length === 0) return;
+    if (embeds.length === 0 && !hasPlainCandidate) return;
 
     const bridge = this.readBridgeInfo();
+    const adapter = this.app.vault.adapter;
+    const vaultBase = adapter instanceof FileSystemAdapter ? adapter.getBasePath() : null;
     let failures = 0;
 
     // 1) Internal embeds: resolve the linkpath via the vault, not the async-loaded <img>.
+    //    Replacing the wrapper detaches its inner <img>, so the plain-image pass below (which
+    //    is queried afterwards) won't see it and re-upload it.
     for (const embed of embeds) {
       const linkpath = embed.getAttribute("src") ?? "";
       const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
@@ -149,10 +154,16 @@ export default class ObsidianToAnkiPlugin extends Plugin {
       }
     }
 
-    // 2) Plain <img> tags pointing at a local resource (e.g. ![](local.png)).
+    // 2) Remaining plain <img> tags pointing at a vault resource (e.g. ![](local.png)).
+    //    Queried now, after the embed loop, so handled embeds are already gone.
+    const plainImgs = Array.from(container.querySelectorAll("img")).filter(
+      (img) => localPathFromSrc(img.getAttribute("src")) !== null,
+    );
     for (const img of plainImgs) {
       const path = localPathFromSrc(img.getAttribute("src"));
       if (!path) continue;
+      // Defence in depth: app:// is already vault-scoped, but never read outside the vault.
+      if (vaultBase && !isInsideVault(vaultBase, path)) continue;
       try {
         const data = readFileSync(path);
         const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
@@ -296,18 +307,24 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * Map a rendered <img src> to a local filesystem path, or null if it isn't a local vault
- * resource. Obsidian renders vault images to app:// (and occasionally file://) URLs whose
- * pathname is the absolute file path; remote (http/https) and inline (data:) are skipped.
+ * Map a rendered <img src> to a local filesystem path, or null if it isn't a vault
+ * resource. Only Obsidian's app:// protocol is accepted (it always points at a vault file);
+ * file://, remote (http/https), and inline (data:) sources are deliberately NOT read, so a
+ * hand-written `![](file:///…/secret)` can never copy an arbitrary local file into Anki.
  */
 function localPathFromSrc(src: string | null): string | null {
-  if (!src || /^(https?|data):/i.test(src)) return null;
-  if (!src.startsWith("app://") && !src.startsWith("file://")) return null;
+  if (!src || !src.startsWith("app://")) return null;
   try {
     return decodeURIComponent(new URL(src).pathname);
   } catch {
     return null;
   }
+}
+
+/** True if `target` resolves to a path inside `base` (guards against traversal). */
+function isInsideVault(base: string, target: string): boolean {
+  const rel = relative(base, target);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 class OtaSettingTab extends PluginSettingTab {
