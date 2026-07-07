@@ -39,6 +39,96 @@ _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
 # land the paste — useful for diagnosing what your setup needs.
 RAISE_ON_INSERT = os.environ.get("BRIDGE_RAISE_ON_INSERT") == "1"
 
+# Caret-within-field insert: the background path re-focuses the target field with Anki's
+# focusField(), whose refocus() calls moveCaretToEnd() — so without help every paste lands
+# at the *end* of the field. This script (injected into the editor webview) records the
+# caret position while the user edits and can freeze/restore it around focusField(), so the
+# paste lands where the caret actually was. It leans on Anki's own selection serializer
+# (require("anki/location").saveSelection/restoreSelection), which encodes a caret as
+# coordinates relative to the field's contenteditable — stable across the blur/focus dance.
+# Everything is best-effort and guarded: if the location package is missing (older Anki) or
+# the coordinates no longer resolve, the helpers return false and we fall back to Anki's
+# end-of-field behaviour. Idempotent: re-injecting is a no-op after the first run.
+_CARET_JS = r"""
+(function () {
+  if (window.__otaCaretHook) { return; }
+  window.__otaCaretHook = true;
+
+  // The focused rich-text editable, mirroring Anki's activeRichTextEditable(): it is
+  // either document.activeElement itself or one shadow level down (the RichTextInput host).
+  function editable() {
+    var a = document.activeElement;
+    if (!a) { return null; }
+    if (a.matches && a.matches("anki-editable")) { return a; }
+    var s = a.shadowRoot && a.shadowRoot.activeElement;
+    if (s && s.matches && s.matches("anki-editable")) { return s; }
+    return null;
+  }
+  window.__otaEditable = editable;
+
+  function loc() {
+    try { return require("anki/location"); } catch (e) { return null; }
+  }
+
+  // Continuously remember the caret while a field is focused, so we still have a target
+  // even if the live selection is disturbed before we freeze it.
+  document.addEventListener("selectionchange", function () {
+    var ed = editable();
+    if (!ed) { return; }
+    var l = loc();
+    if (!l) { return; }
+    try {
+      var saved = l.saveSelection(ed);
+      if (saved) { window.__otaCaret = saved; window.__otaCaretEditable = ed; }
+    } catch (e) {}
+  }, true);
+
+  // Snapshot the caret *before* focusField() moves it. Prefer the live selection (the
+  // target field is still the active editable while Anki is backgrounded); fall back to the
+  // last position the recorder saw. Returns true if we captured something to restore.
+  window.__otaFreezeCaret = function () {
+    var ed = editable();
+    var saved = null;
+    var l = loc();
+    if (ed && l) {
+      try { saved = l.saveSelection(ed); } catch (e) {}
+    }
+    if (!saved) { saved = window.__otaCaret || null; ed = window.__otaCaretEditable || ed; }
+    window.__otaFrozenCaret = saved;
+    window.__otaFrozenEditable = saved ? ed : null;
+    return !!saved;
+  };
+
+  // Restore the frozen caret into the now-active target field, just before pasting. Refuse
+  // if the active field isn't the one we captured, so we never restore bogus coordinates
+  // into the wrong field — the caller then keeps focusField()'s end-of-field caret.
+  window.__otaRestoreCaret = function () {
+    var saved = window.__otaFrozenCaret;
+    if (!saved) { return false; }
+    var ed = editable();
+    if (!ed) { return false; }
+    if (window.__otaFrozenEditable && window.__otaFrozenEditable !== ed) { return false; }
+    var l = loc();
+    if (!l) { return false; }
+    try { l.restoreSelection(ed, saved); return true; } catch (e) { return false; }
+  };
+})();
+"""
+
+
+def _inject_caret_helpers(editor: Any) -> None:
+    """Install the caret recorder/restore helpers into the editor webview (idempotent).
+
+    Injected on note load so the recorder is listening while the user edits, and again just
+    before a background insert as a safety net if the load-time injection was missed."""
+    web = getattr(editor, "web", None)
+    if web is None:
+        return
+    try:
+        web.eval(_CARET_JS)
+    except Exception:
+        traceback.print_exc()
+
 _editors: weakref.WeakSet[Any] = weakref.WeakSet()
 _server: ThreadingHTTPServer | None = None
 _server_thread: threading.Thread | None = None
@@ -186,12 +276,16 @@ def _on_unfocus_field(changed: bool, note: Any = None, field_idx: int | None = N
 
 
 def _on_load_note(editor: Any) -> None:
-    """When an editor loads a *different* note, any field we remembered for it is stale.
+    """Runs on every note load. Injects the caret helpers (so the recorder is listening
+    while the user edits) and drops stale focus memory.
+
+    When an editor loads a *different* note, any field we remembered for it is stale.
 
     Must compare note ids, not just fire on any load: editing a field with changes blurs
     with `changed=True`, which makes Anki reload the *same* note. That reload fires this
     hook right after we recorded the target, so clearing unconditionally would wipe the
     memory the background /insert flow depends on."""
+    _inject_caret_helpers(editor)
     if _last_focus_ref is not None and _last_focus_ref() is editor:
         note = getattr(editor, "note", None)
         if _note_key(note) != _last_focus_note_key:
@@ -329,8 +423,10 @@ def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, 
         editor.currentField = field_idx
         source_updated = True
 
-    # A reload resets the webview's focus, so re-assert the target field even if it looked
-    # focused before we touched the source field.
+    restored_caret = False
+    # Re-assert the target field when Anki is backgrounded (blurred); also after a
+    # source-field reload, which resets the webview's focus even if it looked focused. The
+    # reload moves the caret to the field's end, so the restore below just re-pins that.
     if not was_focused or source_updated:
         # The field is blurred (Anki isn't frontmost). Re-assert it before pasting so the
         # HTML lands in the intended field rather than nowhere.
@@ -339,15 +435,28 @@ def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, 
             window.activateWindow()
             window.raise_()
             raised_window = True
+
+        # Freeze the caret *first*, while the target field is still the active editable with
+        # the user's caret intact — focusField() below moves it to the field's end.
+        _inject_caret_helpers(editor)
+        editor.web.eval("window.__otaFreezeCaret && window.__otaFreezeCaret();")
+
         try:
             editor.web.setFocus()
         except Exception:
             pass
         editor.currentField = field_idx
-        # focusField() places the caret inside the target field. It is queued before the
-        # paste eval, and the webview runs evals in submission order, so the paste lands
-        # in this field.
+        # focusField() places the caret at the *end* of the target field. It is queued
+        # before the paste eval, and the webview runs evals in submission order, so the
+        # paste lands in this field.
         editor.web.eval(f"focusField({int(field_idx)});")
+        # Restore the frozen caret so the paste lands where the user's cursor was, not at
+        # the field's end. Best-effort: on failure the end-of-field caret from focusField()
+        # remains, which is the prior behaviour. We can't read the JS result synchronously
+        # (the webview shares this thread), so `restored_caret` reports the attempt, not a
+        # confirmed success — the paste position is the real signal.
+        editor.web.eval("window.__otaRestoreCaret && window.__otaRestoreCaret();")
+        restored_caret = True
 
     editor.doPaste(html, internal=False, extended=True)
     return {
@@ -358,6 +467,7 @@ def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, 
         "was_focused": was_focused,
         "raised_window": raised_window,
         "source_updated": source_updated,
+        "restored_caret": restored_caret,
         "mode": getattr(editor, "editorMode", None)
         and getattr(editor.editorMode, "name", str(editor.editorMode)),
     }
