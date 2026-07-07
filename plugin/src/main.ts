@@ -16,19 +16,22 @@ import { basename, join } from "node:path";
 import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
 
 /**
- * Milestone M1: send the current Markdown selection into the focused Anki editor
- * field. Renders via Obsidian's own MarkdownRenderer for fidelity and posts the HTML
- * to the local bridge add-on. Math delimiter handling (M2) and image media upload
- * (M3) are intentionally not done here.
+ * Send the current Markdown selection into the focused Anki editor field. Renders via
+ * Obsidian's own MarkdownRenderer for fidelity, then post-processes for Anki: preserve
+ * LaTeX as delimiters (M2), upload local images into the media collection (M3), and strip
+ * Obsidian-specific markup (M4). The HTML is posted to the local bridge add-on.
  */
 
 interface OtaSettings {
   /** Override path to the bridge discovery file; empty = platform default. */
   bridgeFilePath: string;
+  /** Convert internal/wiki links to plain text (their targets are dead in Anki). */
+  unwrapWikilinks: boolean;
 }
 
 const DEFAULT_SETTINGS: OtaSettings = {
   bridgeFilePath: "",
+  unwrapWikilinks: true,
 };
 
 function defaultBridgeFile(): string {
@@ -103,6 +106,7 @@ export default class ObsidianToAnkiPlugin extends Plugin {
       await MarkdownRenderer.render(this.app, processed, container, sourcePath, component);
       this.restoreMath(container, math);
       await this.processImages(container, sourcePath);
+      this.cleanupForAnki(container);
       return container.innerHTML;
     } finally {
       component.unload();
@@ -250,6 +254,34 @@ export default class ObsidianToAnkiPlugin extends Plugin {
     }
   }
 
+  /**
+   * Strip Obsidian-specific cruft so the HTML sits cleanly in an Anki card: unwrap dead
+   * internal/wiki links to text (keeping real external links), and remove class / dir /
+   * data-* / aria-* attributes that only mean something inside Obsidian.
+   */
+  private cleanupForAnki(container: HTMLElement): void {
+    // Links first (uses href/class before we strip them).
+    container.querySelectorAll("a").forEach((a) => {
+      const href = a.getAttribute("href") ?? "";
+      const external = /^(https?|mailto):/i.test(href);
+      if (!external && this.settings.unwrapWikilinks) {
+        a.replaceWith(document.createTextNode(a.textContent ?? ""));
+      } else if (external) {
+        a.setAttribute("href", href);
+      }
+    });
+
+    // Remove Obsidian-only attributes everywhere; keep href/src/style and structure.
+    container.querySelectorAll("*").forEach((el) => {
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name;
+        if (name === "class" || name === "dir" || name.startsWith("data-") || name.startsWith("aria-")) {
+          el.removeAttribute(name);
+        }
+      }
+    });
+  }
+
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
@@ -301,6 +333,19 @@ class OtaSettingTab extends PluginSettingTab {
             this.plugin.settings.bridgeFilePath = value;
             await this.plugin.saveSettings();
           }),
+      );
+
+    new Setting(containerEl)
+      .setName("Unwrap wiki links")
+      .setDesc(
+        "Convert internal/wiki links to plain text (their targets don't resolve in Anki). " +
+          "Disable to keep them as links.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.unwrapWikilinks).onChange(async (value) => {
+          this.plugin.settings.unwrapWikilinks = value;
+          await this.plugin.saveSettings();
+        }),
       );
   }
 }
