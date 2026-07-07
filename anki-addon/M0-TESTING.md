@@ -26,8 +26,14 @@ Restart Anki. (Disable the old packaged copy of the addon so they don't both bin
 - When the target field is blurred (Anki backgrounded), it re-focuses that field
   (`web.setFocus()` + `focusField(idx)`) before `doPaste`, **without raising the Anki
   window** by default.
+- The insert lands **at the caret position within that field**, not at the field's end.
+  `focusField(idx)` moves the caret to the end, so the addon freezes the real caret first
+  (via Anki's `require("anki/location").saveSelection`) and restores it just before pasting.
+  Best-effort: if the location package is unavailable or the coordinates no longer resolve,
+  it falls back to Anki's end-of-field behaviour.
 - The `/insert` response now includes diagnostics: `from_memory`, `was_focused`,
-  `target_field_index`, `raised_window`.
+  `target_field_index`, `raised_window`, `restored_caret` (whether the caret
+  freeze/restore was attempted — the background path).
 
 ## Test A — the real scenario (backgrounded insert)
 
@@ -48,6 +54,19 @@ Restart Anki. (Disable the old packaged copy of the addon so they don't both bin
 4. **Pass:** the text appears in the field you seeded, Anki stays in the background, and
    the JSON response shows `"ok": true, "from_memory": true, "was_focused": false`.
    **Fail:** empty response error, or the text lands nowhere / in the wrong field.
+
+## Test C — caret position within the field
+
+Confirms the paste lands where your cursor was, not appended at the end.
+
+1. Open the Add window, click into a field and type `foobar`.
+2. Click (or arrow) to place the caret **between `foo` and `bar`**, then switch to another
+   app so Anki is backgrounded.
+3. Run the Test A command but with a distinctive body, e.g. `body:"XYZ"`.
+4. **Pass:** the field reads `fooXYZbar` — inserted at the caret. The JSON response shows
+   `"restored_caret": true`. **Fail:** it reads `foobarXYZ` (appended at the end), which
+   means the freeze/restore didn't take (older Anki without `anki/location`, or a resolve
+   failure) and it fell back to end-of-field.
 
 ## Test B — fallback with window raise
 
