@@ -148,6 +148,12 @@ export default class ObsidianToAnkiPlugin extends Plugin {
         const filename = await this.uploadMedia(bridge, bytes, file.name);
         const img = document.createElement("img");
         img.setAttribute("src", filename);
+        // Preserve sizing from ![[img|300]] embeds (carried on the wrapper or inner <img>).
+        const inner = embed.querySelector("img");
+        for (const dim of ["width", "height"] as const) {
+          const value = inner?.getAttribute(dim) ?? embed.getAttribute(dim);
+          if (value) img.setAttribute(dim, value);
+        }
         embed.replaceWith(img);
       } catch {
         failures += 1;
@@ -315,7 +321,11 @@ function errorMessage(err: unknown): string {
 function localPathFromSrc(src: string | null): string | null {
   if (!src || !src.startsWith("app://")) return null;
   try {
-    return decodeURIComponent(new URL(src).pathname);
+    let path = decodeURIComponent(new URL(src).pathname);
+    // On Windows the pathname is like "/C:/Users/..."; strip the leading slash so it
+    // matches the vault base path and reads correctly.
+    if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1);
+    return path;
   } catch {
     return null;
   }
