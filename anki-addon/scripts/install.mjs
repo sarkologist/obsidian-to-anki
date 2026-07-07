@@ -57,5 +57,22 @@ for (const name of files) {
 // Drop stale bytecode from any previous (possibly symlinked) install so Anki recompiles.
 rmSync(join(targetDir, "__pycache__"), { recursive: true, force: true });
 
+// The earlier dev instructions symlinked a *separate* "<package>_dev" folder at the repo.
+// Left in place it loads as a second copy of the add-on and both bind the server + hooks, so
+// migrate it away: silently unlink a symlink, but only warn for a real directory (we won't
+// delete files we didn't create).
+const legacyDir = join(addonsDir, `${pkg}_dev`);
+if (existsSync(legacyDir)) {
+  if (lstatSync(legacyDir).isSymbolicLink()) {
+    unlinkSync(legacyDir);
+    console.log(`install: removed old dev symlink ${legacyDir}`);
+  } else {
+    console.warn(
+      `install: WARNING a second copy exists at ${legacyDir} — remove it (or disable it in ` +
+        "Anki) so the two don't both bind the bridge.",
+    );
+  }
+}
+
 console.log(`install: deployed "${pkg}" -> ${targetDir}`);
 console.log("install: restart Anki to load the new add-on code.");
