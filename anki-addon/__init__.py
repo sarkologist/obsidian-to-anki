@@ -19,10 +19,22 @@ from aqt.qt import QApplication
 BRIDGE_FILENAME = "alfred-anki-bridge.json"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 
+# M0 (background-field insert): when the insert request arrives, Anki is no longer the
+# frontmost app (the user triggered from Obsidian), so no editor field is focused. We
+# remember the last field the user was in and insert there. Set BRIDGE_RAISE_ON_INSERT=1
+# to also raise/activate the Anki window as a fallback if the gentle focus path fails to
+# land the paste — useful for diagnosing what your setup needs.
+RAISE_ON_INSERT = os.environ.get("BRIDGE_RAISE_ON_INSERT") == "1"
+
 _editors: weakref.WeakSet[Any] = weakref.WeakSet()
 _server: ThreadingHTTPServer | None = None
 _server_thread: threading.Thread | None = None
 _token = secrets.token_urlsafe(32)
+
+# Last editor + field index observed focused, so we can target it once focus has moved
+# away to another app. Stored as a weakref so a closed editor can be garbage collected.
+_last_focus_ref: "weakref.ref[Any] | None" = None
+_last_focus_field: int | None = None
 
 
 def _bridge_file_path() -> str:
@@ -66,6 +78,40 @@ def _remove_bridge_file() -> None:
 
 def _remember_editor(editor: Any) -> None:
     _editors.add(editor)
+
+
+def _remember_focus(editor: Any) -> None:
+    """Record the editor + field the user is in, so we can target it once focus has
+    moved to another app (e.g. Obsidian) and no field is live-focused anymore."""
+    global _last_focus_ref, _last_focus_field
+    field = getattr(editor, "currentField", None)
+    if field is None:
+        return
+    _last_focus_ref = weakref.ref(editor)
+    _last_focus_field = field
+
+
+def _remembered_editor() -> Any | None:
+    if _last_focus_ref is None:
+        return None
+    editor = _last_focus_ref()
+    if not editor or not getattr(editor, "web", None) or not getattr(editor, "note", None):
+        return None
+    return editor
+
+
+def _on_typing_timer(*args: Any) -> None:
+    """gui_hooks.editor_did_fire_typing_timer passes the note; resolve the editor whose
+    note it is and remember the field being edited. This is the primary way we capture
+    the target field while Anki is still frontmost."""
+    note = args[0] if args else None
+    for editor in list(_editors):
+        if (
+            getattr(editor, "note", None) is note
+            and getattr(editor, "currentField", None) is not None
+        ):
+            _remember_focus(editor)
+            return
 
 
 def _is_focus_inside(editor: Any) -> bool:
@@ -113,22 +159,63 @@ def _active_editor() -> Any | None:
     best = candidates[0]
     if _editor_score(best)[0] <= 0:
         return None
+    _remember_focus(best)
     return best
 
 
 def _insert_html_on_main(html: str) -> dict[str, Any]:
-    editor = _active_editor()
+    # Prefer a live-focused field; otherwise fall back to the last field we remember the
+    # user being in (the common case when triggering from Obsidian: Anki is backgrounded).
+    live = _active_editor()
+    remembered = None if live else _remembered_editor()
+    editor = live or remembered
     if not editor:
         return {
             "ok": False,
-            "error": "No active Anki editor field is focused.",
+            "error": (
+                "No Anki editor to paste into. Open the Add/Edit window and click a "
+                "field at least once so the bridge knows the target."
+            ),
         }
+
+    from_memory = live is None
+    field_idx = getattr(editor, "currentField", None)
+    if field_idx is None:
+        field_idx = _last_focus_field if from_memory else None
+    if field_idx is None:
+        field_idx = 0
+
+    was_focused = _is_focus_inside(editor) and getattr(editor, "currentField", None) is not None
+    raised_window = False
+
+    if not was_focused:
+        # The field is blurred (Anki isn't frontmost). Re-assert it before pasting so the
+        # HTML lands in the intended field rather than nowhere.
+        window = _editor_window(editor)
+        if RAISE_ON_INSERT and window is not None:
+            window.activateWindow()
+            window.raise_()
+            raised_window = True
+        try:
+            editor.web.setFocus()
+        except Exception:
+            pass
+        editor.currentField = field_idx
+        # focusField() places the caret inside the target field. It is queued before the
+        # paste eval, and the webview runs evals in submission order, so the paste lands
+        # in this field.
+        editor.web.eval(f"focusField({int(field_idx)});")
 
     editor.doPaste(html, internal=False, extended=True)
     return {
         "ok": True,
-        "field": editor.currentField,
-        "mode": getattr(editor.editorMode, "name", str(editor.editorMode)),
+        "field": getattr(editor, "currentField", field_idx),
+        "target_field_index": field_idx,
+        "from_memory": from_memory,
+        "was_focused": was_focused,
+        "raised_window": raised_window,
+        "mode": getattr(editor, "editorMode", None)
+        and getattr(editor.editorMode, "name", str(editor.editorMode)),
     }
 
 
@@ -254,3 +341,10 @@ gui_hooks.editor_did_init.append(_remember_editor)
 gui_hooks.profile_did_open.append(_start_server)
 gui_hooks.profile_will_close.append(_remove_bridge_file)
 atexit.register(_shutdown_server)
+
+# Track the field the user is in so we can paste into it once Anki is backgrounded.
+# Guarded because the hook is not present in every Anki version.
+try:
+    gui_hooks.editor_did_fire_typing_timer.append(_on_typing_timer)
+except Exception:
+    traceback.print_exc()
