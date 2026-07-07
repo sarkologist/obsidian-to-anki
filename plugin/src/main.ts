@@ -2,6 +2,7 @@ import {
   App,
   Component,
   Editor,
+  FileSystemAdapter,
   MarkdownRenderer,
   MarkdownView,
   Notice,
@@ -12,23 +13,26 @@ import {
 } from "obsidian";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
 import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
 
 /**
- * Milestone M1: send the current Markdown selection into the focused Anki editor
- * field. Renders via Obsidian's own MarkdownRenderer for fidelity and posts the HTML
- * to the local bridge add-on. Math delimiter handling (M2) and image media upload
- * (M3) are intentionally not done here.
+ * Send the current Markdown selection into the focused Anki editor field. Renders via
+ * Obsidian's own MarkdownRenderer for fidelity, then post-processes for Anki: preserve
+ * LaTeX as delimiters (M2), upload local images into the media collection (M3), and strip
+ * Obsidian-specific markup (M4). The HTML is posted to the local bridge add-on.
  */
 
 interface OtaSettings {
   /** Override path to the bridge discovery file; empty = platform default. */
   bridgeFilePath: string;
+  /** Convert internal/wiki links to plain text (their targets are dead in Anki). */
+  unwrapWikilinks: boolean;
 }
 
 const DEFAULT_SETTINGS: OtaSettings = {
   bridgeFilePath: "",
+  unwrapWikilinks: true,
 };
 
 function defaultBridgeFile(): string {
@@ -102,10 +106,108 @@ export default class ObsidianToAnkiPlugin extends Plugin {
     try {
       await MarkdownRenderer.render(this.app, processed, container, sourcePath, component);
       this.restoreMath(container, math);
+      await this.processImages(container, sourcePath);
+      this.cleanupForAnki(container);
       return container.innerHTML;
     } finally {
       component.unload();
     }
+  }
+
+  /**
+   * Upload local images into Anki's media collection and rewrite each to the stored
+   * filename. Internal embeds (![[img]]) are resolved through the vault API — robust to the
+   * inner <img> not having loaded in a detached container — while plain <img> tags with a
+   * local resource src are read from disk. Remote (http/https) and inline (data:) are left
+   * as-is.
+   */
+  private async processImages(container: HTMLElement, sourcePath: string): Promise<void> {
+    const embeds = Array.from(container.querySelectorAll<HTMLElement>(".image-embed[src]"));
+    const hasPlainCandidate = Array.from(container.querySelectorAll("img")).some(
+      (img) => localPathFromSrc(img.getAttribute("src")) !== null,
+    );
+    if (embeds.length === 0 && !hasPlainCandidate) return;
+
+    const bridge = this.readBridgeInfo();
+    const adapter = this.app.vault.adapter;
+    const vaultBase = adapter instanceof FileSystemAdapter ? adapter.getBasePath() : null;
+    let failures = 0;
+
+    // 1) Internal embeds: resolve the linkpath via the vault, not the async-loaded <img>.
+    //    Replacing the wrapper detaches its inner <img>, so the plain-image pass below (which
+    //    is queried afterwards) won't see it and re-upload it.
+    for (const embed of embeds) {
+      const linkpath = embed.getAttribute("src") ?? "";
+      const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+      if (!file) {
+        failures += 1;
+        continue;
+      }
+      try {
+        const bytes = await this.app.vault.readBinary(file);
+        const filename = await this.uploadMedia(bridge, bytes, file.name);
+        const img = document.createElement("img");
+        img.setAttribute("src", filename);
+        // Preserve sizing from ![[img|300]] embeds (carried on the wrapper or inner <img>).
+        const inner = embed.querySelector("img");
+        for (const dim of ["width", "height"] as const) {
+          const value = inner?.getAttribute(dim) ?? embed.getAttribute(dim);
+          if (value) img.setAttribute(dim, value);
+        }
+        embed.replaceWith(img);
+      } catch {
+        failures += 1;
+      }
+    }
+
+    // 2) Remaining plain <img> tags pointing at a vault resource (e.g. ![](local.png)).
+    //    Queried now, after the embed loop, so handled embeds are already gone.
+    const plainImgs = Array.from(container.querySelectorAll("img")).filter(
+      (img) => localPathFromSrc(img.getAttribute("src")) !== null,
+    );
+    for (const img of plainImgs) {
+      const path = localPathFromSrc(img.getAttribute("src"));
+      if (!path) continue;
+      // Defence in depth: app:// is already vault-scoped, but never read outside the vault.
+      if (vaultBase && !isInsideVault(vaultBase, path)) continue;
+      try {
+        const data = readFileSync(path);
+        const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+        const filename = await this.uploadMedia(bridge, bytes, basename(path));
+        img.setAttribute("src", filename);
+        for (const attr of ["alt", "referrerpolicy", "loading", "draggable"]) {
+          img.removeAttribute(attr);
+        }
+      } catch {
+        failures += 1;
+      }
+    }
+
+    if (failures > 0) {
+      new Notice(`Obsidian → Anki: ${failures} image(s) could not be uploaded.`);
+    }
+  }
+
+  private async uploadMedia(bridge: BridgeInfo, bytes: ArrayBuffer, name: string): Promise<string> {
+    const url = new URL(bridge.url);
+    url.pathname = "/media";
+    url.searchParams.set("name", name);
+    const response = await requestUrl({
+      url: url.toString(),
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bridge.token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bytes,
+      throw: false,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`media upload ${response.status}: ${response.text}`);
+    }
+    const filename = (response.json as { filename?: string } | undefined)?.filename;
+    if (!filename) throw new Error("media response missing filename");
+    return filename;
   }
 
   /** Swap each math placeholder for the Anki delimiter form of its LaTeX. */
@@ -169,6 +271,33 @@ export default class ObsidianToAnkiPlugin extends Plugin {
     }
   }
 
+  /**
+   * Strip Obsidian-specific cruft so the HTML sits cleanly in an Anki card: unwrap dead
+   * internal/wiki links to text (keeping real external links), and remove class / dir /
+   * data-* / aria-* attributes that only mean something inside Obsidian.
+   */
+  private cleanupForAnki(container: HTMLElement): void {
+    // Links first (keys off Obsidian's internal-link class, before we strip classes).
+    // Only internal/wiki links are unwrapped; every real external scheme (http, mailto,
+    // zotero://, tel:, …) is left as a link. Unwrap by moving the anchor's children out
+    // rather than flattening to text, so nested images/formatting survive.
+    if (this.settings.unwrapWikilinks) {
+      container.querySelectorAll("a.internal-link").forEach((a) => {
+        a.replaceWith(...Array.from(a.childNodes));
+      });
+    }
+
+    // Remove Obsidian-only attributes everywhere; keep href/src/style and structure.
+    container.querySelectorAll("*").forEach((el) => {
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name;
+        if (name === "class" || name === "dir" || name.startsWith("data-") || name.startsWith("aria-")) {
+          el.removeAttribute(name);
+        }
+      }
+    });
+  }
+
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
@@ -180,6 +309,31 @@ export default class ObsidianToAnkiPlugin extends Plugin {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Map a rendered <img src> to a local filesystem path, or null if it isn't a vault
+ * resource. Only Obsidian's app:// protocol is accepted (it always points at a vault file);
+ * file://, remote (http/https), and inline (data:) sources are deliberately NOT read, so a
+ * hand-written `![](file:///…/secret)` can never copy an arbitrary local file into Anki.
+ */
+function localPathFromSrc(src: string | null): string | null {
+  if (!src || !src.startsWith("app://")) return null;
+  try {
+    let path = decodeURIComponent(new URL(src).pathname);
+    // On Windows the pathname is like "/C:/Users/..."; strip the leading slash so it
+    // matches the vault base path and reads correctly.
+    if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1);
+    return path;
+  } catch {
+    return null;
+  }
+}
+
+/** True if `target` resolves to a path inside `base` (guards against traversal). */
+function isInsideVault(base: string, target: string): boolean {
+  const rel = relative(base, target);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 class OtaSettingTab extends PluginSettingTab {
@@ -205,6 +359,19 @@ class OtaSettingTab extends PluginSettingTab {
             this.plugin.settings.bridgeFilePath = value;
             await this.plugin.saveSettings();
           }),
+      );
+
+    new Setting(containerEl)
+      .setName("Unwrap wiki links")
+      .setDesc(
+        "Convert internal/wiki links to plain text (their targets don't resolve in Anki). " +
+          "Disable to keep them as links.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.unwrapWikilinks).onChange(async (value) => {
+          this.plugin.settings.unwrapWikilinks = value;
+          await this.plugin.saveSettings();
+        }),
       );
   }
 }

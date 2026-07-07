@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import secrets
@@ -18,6 +19,17 @@ from aqt.qt import QApplication
 
 BRIDGE_FILENAME = "alfred-anki-bridge.json"
 MAX_BODY_BYTES = 5 * 1024 * 1024
+# Images can be larger than the HTML payload; allow more headroom for /media uploads.
+MAX_MEDIA_BYTES = 32 * 1024 * 1024
+
+# Minimal magic-number sniffing, used only when the uploaded name lacks a usable extension.
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+)
 
 # M0 (background-field insert): when the insert request arrives, Anki is no longer the
 # frontmost app (the user triggered from Obsidian), so no editor field is focused. We
@@ -304,6 +316,32 @@ def _insert_html_on_main(html: str) -> dict[str, Any]:
     }
 
 
+def _guess_extension(suggested_name: str, data: bytes) -> str:
+    ext = os.path.splitext(suggested_name)[1].lower()
+    if ext and len(ext) <= 6:
+        return ext
+    for magic, guessed in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return guessed
+    return ".png"
+
+
+def _store_media_on_main(data: bytes, suggested_name: str) -> dict[str, Any]:
+    """Write image bytes into the collection's media folder, named by content hash so the
+    same image dedups to one file. Returns the stored filename for the plugin to reference."""
+    col = getattr(aqt.mw, "col", None)
+    if col is None:
+        return {"ok": False, "error": "No Anki collection is open."}
+
+    ext = _guess_extension(suggested_name, data)
+    fname = f"ota-{hashlib.sha1(data).hexdigest()[:16]}{ext}"
+    try:
+        stored = col.media.write_data(fname, data)
+    except Exception:
+        return {"ok": False, "error": traceback.format_exc()}
+    return {"ok": True, "filename": stored}
+
+
 def _run_on_main_sync(func: Any, timeout: float = 5.0) -> dict[str, Any]:
     done = threading.Event()
     result: dict[str, Any] = {}
@@ -361,7 +399,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/insert":
+        if parsed.path not in ("/insert", "/media"):
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False})
             return
 
@@ -382,15 +420,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if content_length <= 0 or content_length > MAX_BODY_BYTES:
+        limit = MAX_MEDIA_BYTES if parsed.path == "/media" else MAX_BODY_BYTES
+        if content_length <= 0 or content_length > limit:
             self._send_json(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                 {"ok": False, "error": "Invalid request body size."},
             )
             return
 
-        html = self.rfile.read(content_length).decode("utf8")
-        result = _run_on_main_sync(lambda: _insert_html_on_main(html))
+        body = self.rfile.read(content_length)
+        if parsed.path == "/media":
+            name = parse_qs(parsed.query).get("name", [""])[0]
+            result = _run_on_main_sync(lambda: _store_media_on_main(body, name))
+        else:
+            html = body.decode("utf8")
+            result = _run_on_main_sync(lambda: _insert_html_on_main(html))
         status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
         self._send_json(status, result)
 
