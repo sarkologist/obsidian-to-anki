@@ -4,16 +4,22 @@ The whole "trigger from Obsidian" design rests on one assumption: **the addon ca
 into the field you last used in Anki even while Anki is in the background.** This change
 implements that; these steps confirm whether it actually works on your machine.
 
-## Install the dev addon
+## Install the addon
 
-Symlink (or copy) this folder into Anki's addon directory so edits are picked up:
+Deploy this folder into Anki's addon directory as static files:
 
 ```bash
-ln -s "$(pwd)/anki-addon" \
-  "$HOME/Library/Application Support/Anki2/addons21/alfred_anki_html_bridge_dev"
+node anki-addon/scripts/install.mjs
+# or, for a non-default Anki location:
+ANKI_ADDONS_DIR=/path/to/addons21 node anki-addon/scripts/install.mjs
 ```
 
-Restart Anki. (Disable the old packaged copy of the addon so they don't both bind.)
+Restart Anki to load the new code. Re-run the script (and restart) after each change.
+
+> Don't symlink `addons21/<package>/__init__.py` at the repo file. It's tempting, but with
+> git worktrees the symlink pins Anki to one branch's checkout and dangles once that
+> worktree is removed. The script copies static files so the running addon is decoupled from
+> the working tree (it also replaces any leftover symlink from the old approach).
 
 ## What changed
 
