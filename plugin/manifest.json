@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-to-anki",
+  "name": "Obsidian to Anki",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Send the current Markdown selection into the focused Anki editor field via a local bridge add-on.",
+  "author": "sarkologist",
+  "isDesktopOnly": true
+}

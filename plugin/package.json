@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-to-anki-plugin",
+  "version": "0.1.0",
+  "description": "Obsidian plugin that sends the current Markdown selection into the focused Anki editor field.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
+    "install-plugin": "npm run build && node scripts/install.mjs"
+  },
+  "keywords": ["obsidian", "anki"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "^1.4.11",
+    "typescript": "^5.4.0"
+  }
+}
