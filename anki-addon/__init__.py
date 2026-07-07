@@ -33,11 +33,19 @@ _token = secrets.token_urlsafe(32)
 
 # Last editor + field index observed focused, so we can target it once focus has moved
 # away to another app. Stored as a weakref so a closed editor can be garbage collected.
-# We also record the note id at capture time: if the editor has since loaded a different
-# note, the remembered field index is meaningless and the memory must be discarded.
+# We also record a note key at capture time: if the editor has since loaded a different
+# note, the remembered field index is meaningless and the memory must be discarded. The
+# key is (id, guid) — unsaved Add-window notes all share id 0, so guid is what actually
+# distinguishes them, while id covers notes without a guid.
 _last_focus_ref: "weakref.ref[Any] | None" = None
 _last_focus_field: int | None = None
-_last_focus_note_id: int | None = None
+_last_focus_note_key: tuple[Any, Any] | None = None
+
+
+def _note_key(note: Any) -> tuple[Any, Any] | None:
+    if note is None:
+        return None
+    return (getattr(note, "id", None), getattr(note, "guid", None))
 
 
 def _bridge_file_path() -> str:
@@ -88,7 +96,7 @@ def _remember_focus(editor: Any, field: int | None = None) -> None:
     moved to another app (e.g. Obsidian) and no field is live-focused anymore. Pass an
     explicit `field` when capturing from a blur/unfocus event, where `currentField` may
     already have been cleared."""
-    global _last_focus_ref, _last_focus_field, _last_focus_note_id
+    global _last_focus_ref, _last_focus_field, _last_focus_note_key
     if field is None:
         field = getattr(editor, "currentField", None)
     if field is None:
@@ -96,14 +104,14 @@ def _remember_focus(editor: Any, field: int | None = None) -> None:
     note = getattr(editor, "note", None)
     _last_focus_ref = weakref.ref(editor)
     _last_focus_field = field
-    _last_focus_note_id = getattr(note, "id", None)
+    _last_focus_note_key = _note_key(note)
 
 
 def _clear_focus_memory() -> None:
-    global _last_focus_ref, _last_focus_field, _last_focus_note_id
+    global _last_focus_ref, _last_focus_field, _last_focus_note_key
     _last_focus_ref = None
     _last_focus_field = None
-    _last_focus_note_id = None
+    _last_focus_note_key = None
 
 
 def _remembered_editor() -> Any | None:
@@ -117,7 +125,7 @@ def _remembered_editor() -> Any | None:
         return None
     # The editor may have loaded a different note since we remembered the field; if so the
     # remembered index is meaningless, so refuse it rather than paste into the wrong note.
-    if getattr(note, "id", None) != _last_focus_note_id:
+    if _note_key(note) != _last_focus_note_key:
         return None
     return editor
 
@@ -170,7 +178,7 @@ def _on_load_note(editor: Any) -> None:
     memory the background /insert flow depends on."""
     if _last_focus_ref is not None and _last_focus_ref() is editor:
         note = getattr(editor, "note", None)
-        if getattr(note, "id", None) != _last_focus_note_id:
+        if _note_key(note) != _last_focus_note_key:
             _clear_focus_memory()
 
 
@@ -245,10 +253,19 @@ def _insert_html_on_main(html: str) -> dict[str, Any]:
     if field_idx is None:
         field_idx = 0
 
-    # Guard against a stale/out-of-range index (e.g. a notetype with fewer fields).
+    # If the remembered field no longer exists (e.g. switched to a notetype with fewer
+    # fields), fail rather than silently pasting into a different field the user didn't
+    # seed — a wrong-field paste that reports success is worse than a clear error.
     count = _field_count(editor)
-    if count is not None and count > 0 and field_idx >= count:
-        field_idx = 0
+    if count is not None and field_idx >= count:
+        _clear_focus_memory()
+        return {
+            "ok": False,
+            "error": (
+                f"The field you seeded (index {field_idx}) no longer exists — the note "
+                f"now has {count} field(s). Click the target field in Anki again."
+            ),
+        }
 
     was_focused = _is_focus_inside(editor) and getattr(editor, "currentField", None) is not None
     raised_window = False
