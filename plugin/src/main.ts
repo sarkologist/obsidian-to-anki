@@ -12,7 +12,7 @@ import {
 } from "obsidian";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
 
 /**
@@ -102,10 +102,91 @@ export default class ObsidianToAnkiPlugin extends Plugin {
     try {
       await MarkdownRenderer.render(this.app, processed, container, sourcePath, component);
       this.restoreMath(container, math);
+      await this.processImages(container, sourcePath);
       return container.innerHTML;
     } finally {
       component.unload();
     }
+  }
+
+  /**
+   * Upload local images into Anki's media collection and rewrite each to the stored
+   * filename. Internal embeds (![[img]]) are resolved through the vault API — robust to the
+   * inner <img> not having loaded in a detached container — while plain <img> tags with a
+   * local resource src are read from disk. Remote (http/https) and inline (data:) are left
+   * as-is.
+   */
+  private async processImages(container: HTMLElement, sourcePath: string): Promise<void> {
+    const embeds = Array.from(container.querySelectorAll<HTMLElement>(".image-embed[src]"));
+    const plainImgs = Array.from(container.querySelectorAll("img")).filter(
+      (img) => localPathFromSrc(img.getAttribute("src")) !== null,
+    );
+    if (embeds.length === 0 && plainImgs.length === 0) return;
+
+    const bridge = this.readBridgeInfo();
+    let failures = 0;
+
+    // 1) Internal embeds: resolve the linkpath via the vault, not the async-loaded <img>.
+    for (const embed of embeds) {
+      const linkpath = embed.getAttribute("src") ?? "";
+      const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+      if (!file) {
+        failures += 1;
+        continue;
+      }
+      try {
+        const bytes = await this.app.vault.readBinary(file);
+        const filename = await this.uploadMedia(bridge, bytes, file.name);
+        const img = document.createElement("img");
+        img.setAttribute("src", filename);
+        embed.replaceWith(img);
+      } catch {
+        failures += 1;
+      }
+    }
+
+    // 2) Plain <img> tags pointing at a local resource (e.g. ![](local.png)).
+    for (const img of plainImgs) {
+      const path = localPathFromSrc(img.getAttribute("src"));
+      if (!path) continue;
+      try {
+        const data = readFileSync(path);
+        const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+        const filename = await this.uploadMedia(bridge, bytes, basename(path));
+        img.setAttribute("src", filename);
+        for (const attr of ["alt", "referrerpolicy", "loading", "draggable"]) {
+          img.removeAttribute(attr);
+        }
+      } catch {
+        failures += 1;
+      }
+    }
+
+    if (failures > 0) {
+      new Notice(`Obsidian → Anki: ${failures} image(s) could not be uploaded.`);
+    }
+  }
+
+  private async uploadMedia(bridge: BridgeInfo, bytes: ArrayBuffer, name: string): Promise<string> {
+    const url = new URL(bridge.url);
+    url.pathname = "/media";
+    url.searchParams.set("name", name);
+    const response = await requestUrl({
+      url: url.toString(),
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bridge.token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bytes,
+      throw: false,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`media upload ${response.status}: ${response.text}`);
+    }
+    const filename = (response.json as { filename?: string } | undefined)?.filename;
+    if (!filename) throw new Error("media response missing filename");
+    return filename;
   }
 
   /** Swap each math placeholder for the Anki delimiter form of its LaTeX. */
@@ -180,6 +261,21 @@ export default class ObsidianToAnkiPlugin extends Plugin {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Map a rendered <img src> to a local filesystem path, or null if it isn't a local vault
+ * resource. Obsidian renders vault images to app:// (and occasionally file://) URLs whose
+ * pathname is the absolute file path; remote (http/https) and inline (data:) are skipped.
+ */
+function localPathFromSrc(src: string | null): string | null {
+  if (!src || /^(https?|data):/i.test(src)) return null;
+  if (!src.startsWith("app://") && !src.startsWith("file://")) return null;
+  try {
+    return decodeURIComponent(new URL(src).pathname);
+  } catch {
+    return null;
+  }
 }
 
 class OtaSettingTab extends PluginSettingTab {
