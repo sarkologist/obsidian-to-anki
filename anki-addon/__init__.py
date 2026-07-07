@@ -39,13 +39,16 @@ _token = secrets.token_urlsafe(32)
 # distinguishes them, while id covers notes without a guid.
 _last_focus_ref: "weakref.ref[Any] | None" = None
 _last_focus_field: int | None = None
-_last_focus_note_key: tuple[Any, Any] | None = None
+_last_focus_note_key: tuple[Any, Any, Any] | None = None
 
 
-def _note_key(note: Any) -> tuple[Any, Any] | None:
+def _note_key(note: Any) -> tuple[Any, Any, Any] | None:
     if note is None:
         return None
-    return (getattr(note, "id", None), getattr(note, "guid", None))
+    # Include mid (notetype id): converting a note to another notetype keeps the same
+    # id/guid but changes the field layout, which would otherwise make a stale field
+    # index look valid.
+    return (getattr(note, "id", None), getattr(note, "guid", None), getattr(note, "mid", None))
 
 
 def _bridge_file_path() -> str:
