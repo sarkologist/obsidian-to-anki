@@ -53,7 +53,12 @@ Operates on the current selection only; no selection → no-op with a toast.
 desktop runs in Electron with Node access, so this just works.
 
 **Settings:** wikilink handling, strip leading note title, image max-width, bridge-file
-path override.
+path override, append-source-link toggle.
+
+**Source backlink:** if the target note has a `source` field, the plugin also hands the
+bridge the current note's `obsidian://open?vault=…&file=…` URL, which the addon appends to
+that field on a new line (as a clickable link, deduped so re-sends don't stack). Notes
+without a `source` field are unaffected. Toggle in settings.
 
 ## Component 2 — bridge addon changes
 
@@ -66,6 +71,9 @@ Two additions to `anki-addon/__init__.py`:
    focused field, which fails the moment focus moves to Obsidian. Track the last
    editor + field index and fall back to it when nothing is focused, inserting into that
    field even while Anki is backgrounded.
+3. **Append the Obsidian backlink.** `/insert` accepts an optional `source_url` query
+   param; when the target note has a `source` field, append it there (deduped) via
+   `loadNote` so it persists on the note's next save, then re-focus the paste target.
 
 **⚠️ Main technical risk (de-risked in M0):** `doPaste` expects an active field/caret.
 Backgrounded + blurred, we must re-assert `currentField` and focus the field

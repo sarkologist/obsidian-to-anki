@@ -8,6 +8,7 @@ import secrets
 import threading
 import traceback
 import weakref
+from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -340,7 +341,37 @@ def _active_editor() -> Any | None:
     return best
 
 
-def _insert_html_on_main(html: str) -> dict[str, Any]:
+def _source_field_name(note: Any) -> str | None:
+    """Name of the note's "source" field (case-insensitive), or None if it has none."""
+    try:
+        keys = note.keys()
+    except Exception:
+        return None
+    return next((key for key in keys if key.lower() == "source"), None)
+
+
+def _append_source_field(note: Any, source_url: str) -> bool:
+    """If the note has a "source" field, append `source_url` to it as a clickable link on a
+    new line. Idempotent: a URL already present is not appended again (so re-sending from the
+    same Obsidian note doesn't stack duplicates). Returns True if the field was modified.
+
+    Only mutates the in-memory note; the caller reloads the editor so the change is shown and
+    persisted when the note is next flushed."""
+    field_name = _source_field_name(note)
+    if field_name is None:
+        return False
+    escaped = html_escape(source_url, quote=True)
+    link = f'<a href="{escaped}">{escaped}</a>'
+    current = note[field_name]
+    # Match the whole anchor, not just the URL substring: a bare `escaped in current` would
+    # treat file=Foo as already present when the field holds a link to file=FooBar.
+    if link in current:
+        return False
+    note[field_name] = f"{current}<br>{link}" if current.strip() else link
+    return True
+
+
+def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, Any]:
     # Prefer a live-focused field; otherwise fall back to the last field we remember the
     # user being in (the common case when triggering from Obsidian: Anki is backgrounded).
     live = _active_editor()
@@ -379,8 +410,24 @@ def _insert_html_on_main(html: str) -> dict[str, Any]:
     was_focused = _is_focus_inside(editor) and getattr(editor, "currentField", None) is not None
     raised_window = False
 
+    # If asked, drop the Obsidian page URL into the note's "source" field (when it has one).
+    # loadNote pushes the change into the webview so it survives the note's next save, and
+    # re-focuses the paste target so the HTML still lands in the right field.
+    source_updated = False
+    note = getattr(editor, "note", None)
+    if source_url and note is not None and _append_source_field(note, source_url):
+        try:
+            editor.loadNote(focusTo=field_idx)
+        except Exception:
+            traceback.print_exc()
+        editor.currentField = field_idx
+        source_updated = True
+
     restored_caret = False
-    if not was_focused:
+    # Re-assert the target field when Anki is backgrounded (blurred); also after a
+    # source-field reload, which resets the webview's focus even if it looked focused. The
+    # reload moves the caret to the field's end, so the restore below just re-pins that.
+    if not was_focused or source_updated:
         # The field is blurred (Anki isn't frontmost). Re-assert it before pasting so the
         # HTML lands in the intended field rather than nowhere.
         window = _editor_window(editor)
@@ -419,6 +466,7 @@ def _insert_html_on_main(html: str) -> dict[str, Any]:
         "from_memory": from_memory,
         "was_focused": was_focused,
         "raised_window": raised_window,
+        "source_updated": source_updated,
         "restored_caret": restored_caret,
         "mode": getattr(editor, "editorMode", None)
         and getattr(editor.editorMode, "name", str(editor.editorMode)),
@@ -543,7 +591,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             result = _run_on_main_sync(lambda: _store_media_on_main(body, name))
         else:
             html = body.decode("utf8")
-            result = _run_on_main_sync(lambda: _insert_html_on_main(html))
+            source_url = parse_qs(parsed.query).get("source_url", [""])[0] or None
+            result = _run_on_main_sync(lambda: _insert_html_on_main(html, source_url))
         status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
         self._send_json(status, result)
 
