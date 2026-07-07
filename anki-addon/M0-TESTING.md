@@ -17,8 +17,12 @@ Restart Anki. (Disable the old packaged copy of the addon so they don't both bin
 
 ## What changed
 
-- The bridge now remembers the **last field you were typing in** (via the editor typing
-  timer) and, on `/insert`, falls back to that field when nothing is live-focused.
+- The bridge now remembers the **last field you were in** — captured primarily on field
+  unfocus (`editor_did_unfocus_field`, which fires the moment focus leaves the field and
+  carries the field index), with the typing timer as a backup — and, on `/insert`, falls
+  back to that field when nothing is live-focused. The memory is tagged with the note id
+  and discarded if the editor later loads a different note, so a stale index can't paste
+  into the wrong note.
 - When the target field is blurred (Anki backgrounded), it re-focuses that field
   (`web.setFocus()` + `focusField(idx)`) before `doPaste`, **without raising the Anki
   window** by default.
@@ -62,6 +66,7 @@ two-step paste. Record which path worked in the PR.
 
 - `focusField(idx)` is Anki's editor JS; if a future Anki renames it this breaks — the
   diagnostics will show the paste not landing.
-- If you never typed in the field (only clicked), the typing-timer may not have fired;
-  clicking + one keystroke guarantees the field is remembered. A later iteration can also
-  capture pure focus (no keystroke) if needed.
+- Capture now happens on unfocus, so simply clicking a field and then leaving (even
+  without typing) should seed the target. If a given Anki version doesn't fire
+  `editor_did_unfocus_field`, the typing-timer backup still covers the type-then-switch
+  case.
