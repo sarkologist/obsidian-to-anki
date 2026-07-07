@@ -1,0 +1,20 @@
+# Node / Obsidian plugin build
+node_modules/
+main.js
+*.js.map
+build/
+dist/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local env
+.env
