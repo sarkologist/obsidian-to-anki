@@ -162,9 +162,16 @@ def _on_unfocus_field(changed: bool, note: Any = None, field_idx: int | None = N
 
 
 def _on_load_note(editor: Any) -> None:
-    """When an editor loads a different note, any field we remembered for it is stale."""
+    """When an editor loads a *different* note, any field we remembered for it is stale.
+
+    Must compare note ids, not just fire on any load: editing a field with changes blurs
+    with `changed=True`, which makes Anki reload the *same* note. That reload fires this
+    hook right after we recorded the target, so clearing unconditionally would wipe the
+    memory the background /insert flow depends on."""
     if _last_focus_ref is not None and _last_focus_ref() is editor:
-        _clear_focus_memory()
+        note = getattr(editor, "note", None)
+        if getattr(note, "id", None) != _last_focus_note_id:
+            _clear_focus_memory()
 
 
 def _is_focus_inside(editor: Any) -> bool:
