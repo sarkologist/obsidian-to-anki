@@ -43,8 +43,10 @@ export function extractMath(markdown: string): { processed: string; math: MathTo
   const math: MathToken[] = [];
   const codeStore: string[] = [];
 
-  // 1) Protect fenced (``` / ~~~) and inline (`...`) code so their `$` is ignored.
-  let s = markdown.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g, (match) => {
+  // 1) Protect code so its `$` is ignored. A run of N backticks is closed by the next run
+  //    of the same length (\1), which covers fenced blocks and inline spans of any backtick
+  //    count (e.g. ``$x$``); ~~~ fences are handled separately.
+  let s = markdown.replace(/(`+)[\s\S]*?\1|~~~[\s\S]*?~~~/g, (match) => {
     const i = codeStore.length;
     codeStore.push(match);
     return `${NUL}${i}${NUL}`;
