@@ -19,10 +19,36 @@ from aqt.qt import QApplication
 BRIDGE_FILENAME = "alfred-anki-bridge.json"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 
+# M0 (background-field insert): when the insert request arrives, Anki is no longer the
+# frontmost app (the user triggered from Obsidian), so no editor field is focused. We
+# remember the last field the user was in and insert there. Set BRIDGE_RAISE_ON_INSERT=1
+# to also raise/activate the Anki window as a fallback if the gentle focus path fails to
+# land the paste — useful for diagnosing what your setup needs.
+RAISE_ON_INSERT = os.environ.get("BRIDGE_RAISE_ON_INSERT") == "1"
+
 _editors: weakref.WeakSet[Any] = weakref.WeakSet()
 _server: ThreadingHTTPServer | None = None
 _server_thread: threading.Thread | None = None
 _token = secrets.token_urlsafe(32)
+
+# Last editor + field index observed focused, so we can target it once focus has moved
+# away to another app. Stored as a weakref so a closed editor can be garbage collected.
+# We also record a note key at capture time: if the editor has since loaded a different
+# note, the remembered field index is meaningless and the memory must be discarded. The
+# key is (id, guid) — unsaved Add-window notes all share id 0, so guid is what actually
+# distinguishes them, while id covers notes without a guid.
+_last_focus_ref: "weakref.ref[Any] | None" = None
+_last_focus_field: int | None = None
+_last_focus_note_key: tuple[Any, Any, Any] | None = None
+
+
+def _note_key(note: Any) -> tuple[Any, Any, Any] | None:
+    if note is None:
+        return None
+    # Include mid (notetype id): converting a note to another notetype keeps the same
+    # id/guid but changes the field layout, which would otherwise make a stale field
+    # index look valid.
+    return (getattr(note, "id", None), getattr(note, "guid", None), getattr(note, "mid", None))
 
 
 def _bridge_file_path() -> str:
@@ -66,6 +92,97 @@ def _remove_bridge_file() -> None:
 
 def _remember_editor(editor: Any) -> None:
     _editors.add(editor)
+
+
+def _remember_focus(editor: Any, field: int | None = None) -> None:
+    """Record the editor + field the user is in, so we can target it once focus has
+    moved to another app (e.g. Obsidian) and no field is live-focused anymore. Pass an
+    explicit `field` when capturing from a blur/unfocus event, where `currentField` may
+    already have been cleared."""
+    global _last_focus_ref, _last_focus_field, _last_focus_note_key
+    if field is None:
+        field = getattr(editor, "currentField", None)
+    if field is None:
+        return
+    note = getattr(editor, "note", None)
+    _last_focus_ref = weakref.ref(editor)
+    _last_focus_field = field
+    _last_focus_note_key = _note_key(note)
+
+
+def _clear_focus_memory() -> None:
+    global _last_focus_ref, _last_focus_field, _last_focus_note_key
+    _last_focus_ref = None
+    _last_focus_field = None
+    _last_focus_note_key = None
+
+
+def _remembered_editor() -> Any | None:
+    if _last_focus_ref is None:
+        return None
+    editor = _last_focus_ref()
+    if not editor or not getattr(editor, "web", None):
+        return None
+    note = getattr(editor, "note", None)
+    if not note:
+        return None
+    # The editor may have loaded a different note since we remembered the field; if so the
+    # remembered index is meaningless, so refuse it rather than paste into the wrong note.
+    if _note_key(note) != _last_focus_note_key:
+        return None
+    return editor
+
+
+def _field_count(editor: Any) -> int | None:
+    fields = getattr(getattr(editor, "note", None), "fields", None)
+    try:
+        return len(fields) if fields is not None else None
+    except TypeError:
+        return None
+
+
+def _on_typing_timer(*args: Any) -> None:
+    """gui_hooks.editor_did_fire_typing_timer passes the note; resolve the editor whose
+    note it is and remember the field being edited. A backup capture path — the primary
+    one is _on_unfocus_field, which fires without waiting for the typing debounce."""
+    note = args[0] if args else None
+    for editor in list(_editors):
+        if (
+            getattr(editor, "note", None) is note
+            and getattr(editor, "currentField", None) is not None
+        ):
+            _remember_focus(editor)
+            return
+
+
+def _on_unfocus_field(changed: bool, note: Any = None, field_idx: int | None = None) -> bool:
+    """gui_hooks.editor_did_unfocus_field(changed, note, field_idx). Fires the moment a
+    field loses focus (including when the user leaves for another app), and carries the
+    field index explicitly — so we capture the target even on a fast type-then-switch,
+    before `currentField` is cleared.
+
+    This is a *filter* hook: callbacks must return the (possibly updated) `changed` bool.
+    We only observe, so we pass it straight through — returning None would clobber other
+    add-ons' changes and suppress Anki's follow-up editor reload."""
+    if field_idx is not None and note is not None:
+        for editor in list(_editors):
+            if getattr(editor, "note", None) is note:
+                _remember_focus(editor, field_idx)
+                break
+    return changed
+
+
+def _on_load_note(editor: Any) -> None:
+    """When an editor loads a *different* note, any field we remembered for it is stale.
+
+    Must compare note ids, not just fire on any load: editing a field with changes blurs
+    with `changed=True`, which makes Anki reload the *same* note. That reload fires this
+    hook right after we recorded the target, so clearing unconditionally would wipe the
+    memory the background /insert flow depends on."""
+    if _last_focus_ref is not None and _last_focus_ref() is editor:
+        note = getattr(editor, "note", None)
+        if _note_key(note) != _last_focus_note_key:
+            _clear_focus_memory()
 
 
 def _is_focus_inside(editor: Any) -> bool:
@@ -113,22 +230,77 @@ def _active_editor() -> Any | None:
     best = candidates[0]
     if _editor_score(best)[0] <= 0:
         return None
+    _remember_focus(best)
     return best
 
 
 def _insert_html_on_main(html: str) -> dict[str, Any]:
-    editor = _active_editor()
+    # Prefer a live-focused field; otherwise fall back to the last field we remember the
+    # user being in (the common case when triggering from Obsidian: Anki is backgrounded).
+    live = _active_editor()
+    remembered = None if live else _remembered_editor()
+    editor = live or remembered
     if not editor:
         return {
             "ok": False,
-            "error": "No active Anki editor field is focused.",
+            "error": (
+                "No Anki editor to paste into. Open the Add/Edit window and click a "
+                "field at least once so the bridge knows the target."
+            ),
         }
+
+    from_memory = live is None
+    field_idx = getattr(editor, "currentField", None)
+    if field_idx is None:
+        field_idx = _last_focus_field if from_memory else None
+    if field_idx is None:
+        field_idx = 0
+
+    # If the remembered field no longer exists (e.g. switched to a notetype with fewer
+    # fields), fail rather than silently pasting into a different field the user didn't
+    # seed — a wrong-field paste that reports success is worse than a clear error.
+    count = _field_count(editor)
+    if count is not None and field_idx >= count:
+        _clear_focus_memory()
+        return {
+            "ok": False,
+            "error": (
+                f"The field you seeded (index {field_idx}) no longer exists — the note "
+                f"now has {count} field(s). Click the target field in Anki again."
+            ),
+        }
+
+    was_focused = _is_focus_inside(editor) and getattr(editor, "currentField", None) is not None
+    raised_window = False
+
+    if not was_focused:
+        # The field is blurred (Anki isn't frontmost). Re-assert it before pasting so the
+        # HTML lands in the intended field rather than nowhere.
+        window = _editor_window(editor)
+        if RAISE_ON_INSERT and window is not None:
+            window.activateWindow()
+            window.raise_()
+            raised_window = True
+        try:
+            editor.web.setFocus()
+        except Exception:
+            pass
+        editor.currentField = field_idx
+        # focusField() places the caret inside the target field. It is queued before the
+        # paste eval, and the webview runs evals in submission order, so the paste lands
+        # in this field.
+        editor.web.eval(f"focusField({int(field_idx)});")
 
     editor.doPaste(html, internal=False, extended=True)
     return {
         "ok": True,
-        "field": editor.currentField,
-        "mode": getattr(editor.editorMode, "name", str(editor.editorMode)),
+        "field": getattr(editor, "currentField", field_idx),
+        "target_field_index": field_idx,
+        "from_memory": from_memory,
+        "was_focused": was_focused,
+        "raised_window": raised_window,
+        "mode": getattr(editor, "editorMode", None)
+        and getattr(editor.editorMode, "name", str(editor.editorMode)),
     }
 
 
@@ -254,3 +426,18 @@ gui_hooks.editor_did_init.append(_remember_editor)
 gui_hooks.profile_did_open.append(_start_server)
 gui_hooks.profile_will_close.append(_remove_bridge_file)
 atexit.register(_shutdown_server)
+
+# Track the field the user is in so we can paste into it once Anki is backgrounded.
+# Each hook is guarded because availability varies across Anki versions.
+# - editor_did_unfocus_field: primary capture (carries the field index on blur).
+# - editor_did_fire_typing_timer: backup capture while typing.
+# - editor_did_load_note: drop stale memory when an editor swaps to another note.
+for _hook_name, _cb in (
+    ("editor_did_unfocus_field", _on_unfocus_field),
+    ("editor_did_fire_typing_timer", _on_typing_timer),
+    ("editor_did_load_note", _on_load_note),
+):
+    try:
+        getattr(gui_hooks, _hook_name).append(_cb)
+    except Exception:
+        traceback.print_exc()
