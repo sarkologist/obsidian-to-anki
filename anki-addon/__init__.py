@@ -144,19 +144,21 @@ def _on_typing_timer(*args: Any) -> None:
             return
 
 
-def _on_unfocus_field(*args: Any) -> None:
+def _on_unfocus_field(changed: bool, note: Any = None, field_idx: int | None = None) -> bool:
     """gui_hooks.editor_did_unfocus_field(changed, note, field_idx). Fires the moment a
     field loses focus (including when the user leaves for another app), and carries the
     field index explicitly — so we capture the target even on a fast type-then-switch,
-    before `currentField` is cleared."""
-    note = args[1] if len(args) > 1 else None
-    field_idx = args[2] if len(args) > 2 else None
-    if field_idx is None or note is None:
-        return
-    for editor in list(_editors):
-        if getattr(editor, "note", None) is note:
-            _remember_focus(editor, field_idx)
-            return
+    before `currentField` is cleared.
+
+    This is a *filter* hook: callbacks must return the (possibly updated) `changed` bool.
+    We only observe, so we pass it straight through — returning None would clobber other
+    add-ons' changes and suppress Anki's follow-up editor reload."""
+    if field_idx is not None and note is not None:
+        for editor in list(_editors):
+            if getattr(editor, "note", None) is note:
+                _remember_focus(editor, field_idx)
+                break
+    return changed
 
 
 def _on_load_note(editor: Any) -> None:
