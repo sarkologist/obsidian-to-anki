@@ -267,10 +267,12 @@ def _append_source_field(note: Any, source_url: str) -> bool:
     if field_name is None:
         return False
     escaped = html_escape(source_url, quote=True)
-    current = note[field_name]
-    if escaped in current:
-        return False
     link = f'<a href="{escaped}">{escaped}</a>'
+    current = note[field_name]
+    # Match the whole anchor, not just the URL substring: a bare `escaped in current` would
+    # treat file=Foo as already present when the field holds a link to file=FooBar.
+    if link in current:
+        return False
     note[field_name] = f"{current}<br>{link}" if current.strip() else link
     return True
 
