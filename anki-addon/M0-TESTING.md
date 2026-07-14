@@ -33,13 +33,14 @@ Restart Anki to load the new code. Re-run the script (and restart) after each ch
   (`web.setFocus()` + `focusField(idx)`) before `doPaste`, **without raising the Anki
   window** by default.
 - The insert lands **at the caret position within that field**, not at the field's end.
-  `focusField(idx)` moves the caret to the end, so the addon freezes the real caret first
-  (via Anki's `require("anki/location").saveSelection`) and restores it just before pasting.
-  Best-effort: if the location package is unavailable or the coordinates no longer resolve,
-  it falls back to Anki's end-of-field behaviour.
-- The `/insert` response now includes diagnostics: `from_memory`, `was_focused`,
-  `target_field_index`, `raised_window`, `restored_caret` (whether the caret
-  freeze/restore was attempted — the background path).
+  Anything that focuses a field ends in Anki's `moveCaretToEnd()`, so the addon snapshots the
+  real caret (via `require("anki/location").saveSelection`) **before it touches the editor at
+  all**, and restores it just before pasting. Best-effort: if the location package is
+  unavailable or the coordinates no longer resolve, it falls back to end-of-field.
+- The `/insert` response includes diagnostics: `from_memory`, `was_focused`,
+  `target_field_index`, `raised_window`, `source_updated`, and `restored_caret` — the value
+  the webview actually reported (`true`/`false`), or `null` when no restore was needed
+  because the field was already focused with the caret live.
 
 ## Test A — the real scenario (backgrounded insert)
 
@@ -69,10 +70,31 @@ Confirms the paste lands where your cursor was, not appended at the end.
 2. Click (or arrow) to place the caret **between `foo` and `bar`**, then switch to another
    app so Anki is backgrounded.
 3. Run the Test A command but with a distinctive body, e.g. `body:"XYZ"`.
-4. **Pass:** the field reads `fooXYZbar` — inserted at the caret. The JSON response shows
-   `"restored_caret": true`. **Fail:** it reads `foobarXYZ` (appended at the end), which
-   means the freeze/restore didn't take (older Anki without `anki/location`, or a resolve
-   failure) and it fell back to end-of-field.
+4. **Pass:** the field reads `fooXYZbar` — inserted at the caret, and the response shows
+   `"restored_caret": true`. **Fail:** it reads `foobarXYZ` (appended at the end).
+
+The field content is the real signal, not `restored_caret` — a restore can report `true` and
+still land at the end if the caret was snapshotted *after* something moved it (that was the
+Test D bug). Trust the text; use the flag to narrow down why.
+
+## Test D — caret + source link, in the Browse window
+
+The regression that Test C missed. The source-link feature calls `editor.loadNote()`, which
+re-renders the fields and parks the caret at the end — so the caret has to be snapshotted
+before that runs, not after.
+
+1. Enable **Append source link** in the plugin, and pick a note whose notetype **has a
+   `Source` field** — the reload only happens when the link is actually appended.
+2. Open the **Browse** window, click that note, put the caret **between `foo` and `bar`** in
+   a field that already has text.
+3. Switch to Obsidian and send a selection whose Obsidian URL is *not already* in the note's
+   `Source` field (a fresh source triggers the append + reload).
+4. **Pass:** `fooXYZbar`, and the response shows `"source_updated": true` with
+   `"restored_caret": true`. **Fail:** `foobarXYZ`.
+
+This hides in the Add window: there the first paste — the one that appends the link and
+triggers the reload — usually goes into an *empty* field, where "end of field" and "at the
+caret" are the same place.
 
 ## Test B — fallback with window raise
 
