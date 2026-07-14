@@ -11,7 +11,7 @@ import weakref
 from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import aqt
@@ -83,9 +83,15 @@ _CARET_JS = r"""
     } catch (e) {}
   }, true);
 
-  // Snapshot the caret *before* focusField() moves it. Prefer the live selection (the
-  // target field is still the active editable while Anki is backgrounded); fall back to the
-  // last position the recorder saw. Returns true if we captured something to restore.
+  // Snapshot the caret. Prefer the live selection (the target field is still the active
+  // editable while Anki is backgrounded); fall back to the last position the recorder saw.
+  // Returns true if we captured something to restore.
+  //
+  // The caller must invoke this *before* touching the editor at all. Anything that focuses a
+  // field — loadNote(focusTo=...) as well as focusField() — ends in moveCaretToEnd(), which
+  // both moves the live caret and (via selectionchange) overwrites the recorder's copy. Once
+  // that has happened the user's position is gone from every source we have, and freezing
+  // then silently captures the end of the field instead.
   window.__otaFreezeCaret = function () {
     var ed = editable();
     var saved = null;
@@ -99,15 +105,19 @@ _CARET_JS = r"""
     return !!saved;
   };
 
-  // Restore the frozen caret into the now-active target field, just before pasting. Refuse
-  // if the active field isn't the one we captured, so we never restore bogus coordinates
-  // into the wrong field — the caller then keeps focusField()'s end-of-field caret.
+  // Restore the frozen caret into the now-active target field, just before pasting.
   window.__otaRestoreCaret = function () {
     var saved = window.__otaFrozenCaret;
     if (!saved) { return false; }
     var ed = editable();
     if (!ed) { return false; }
-    if (window.__otaFrozenEditable && window.__otaFrozenEditable !== ed) { return false; }
+    // Refuse only when the field we froze is still on the page but is not the one now
+    // focused: focusField() landed elsewhere, and restoring would corrupt another field. A
+    // frozen element that is merely *detached* is fine — the editor re-rendered its fields
+    // (loadNote does this) and handed the target a fresh element. The coordinates are
+    // relative to the field, so they still resolve against the replacement.
+    var frozen = window.__otaFrozenEditable;
+    if (frozen && frozen !== ed && frozen.isConnected) { return false; }
     var l = loc();
     if (!l) { return false; }
     try { l.restoreSelection(ed, saved); return true; } catch (e) { return false; }
@@ -371,20 +381,29 @@ def _append_source_field(note: Any, source_url: str) -> bool:
     return True
 
 
-def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, Any]:
+def _insert_html_on_main(
+    html: str, source_url: str | None, finish: Callable[[dict[str, Any]], None]
+) -> None:
+    """Paste `html` into the remembered field, at the caret the user left there.
+
+    Completes via `finish` rather than by returning, because the caret restore runs in the
+    webview and we want to report what it actually did (see `restored_caret`)."""
     # Prefer a live-focused field; otherwise fall back to the last field we remember the
     # user being in (the common case when triggering from Obsidian: Anki is backgrounded).
     live = _active_editor()
     remembered = None if live else _remembered_editor()
     editor = live or remembered
     if not editor:
-        return {
-            "ok": False,
-            "error": (
-                "No Anki editor to paste into. Open the Add/Edit window and click a "
-                "field at least once so the bridge knows the target."
-            ),
-        }
+        finish(
+            {
+                "ok": False,
+                "error": (
+                    "No Anki editor to paste into. Open the Add/Edit window and click a "
+                    "field at least once so the bridge knows the target."
+                ),
+            }
+        )
+        return
 
     from_memory = live is None
     field_idx = getattr(editor, "currentField", None)
@@ -399,20 +418,31 @@ def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, 
     count = _field_count(editor)
     if count is not None and field_idx >= count:
         _clear_focus_memory()
-        return {
-            "ok": False,
-            "error": (
-                f"The field you seeded (index {field_idx}) no longer exists — the note "
-                f"now has {count} field(s). Click the target field in Anki again."
-            ),
-        }
+        finish(
+            {
+                "ok": False,
+                "error": (
+                    f"The field you seeded (index {field_idx}) no longer exists — the note "
+                    f"now has {count} field(s). Click the target field in Anki again."
+                ),
+            }
+        )
+        return
 
     was_focused = _is_focus_inside(editor) and getattr(editor, "currentField", None) is not None
     raised_window = False
 
+    # Freeze the caret before touching the editor in any way. Every path below that focuses a
+    # field — the source-field loadNote() as well as focusField() — ends in moveCaretToEnd(),
+    # which moves the live caret *and* overwrites the recorder's copy of it. Freezing after
+    # any of that would capture the end of the field and faithfully restore the wrong spot.
+    _inject_caret_helpers(editor)
+    editor.web.eval("window.__otaFreezeCaret && window.__otaFreezeCaret();")
+
     # If asked, drop the Obsidian page URL into the note's "source" field (when it has one).
-    # loadNote pushes the change into the webview so it survives the note's next save, and
-    # re-focuses the paste target so the HTML still lands in the right field.
+    # loadNote pushes the change into the webview so it survives the note's next save. It also
+    # re-renders every field and parks the caret at the end of `focusTo`, which is why the
+    # freeze above has to come first.
     source_updated = False
     note = getattr(editor, "note", None)
     if source_url and note is not None and _append_source_field(note, source_url):
@@ -423,54 +453,68 @@ def _insert_html_on_main(html: str, source_url: str | None = None) -> dict[str, 
         editor.currentField = field_idx
         source_updated = True
 
-    restored_caret = False
-    # Re-assert the target field when Anki is backgrounded (blurred); also after a
-    # source-field reload, which resets the webview's focus even if it looked focused. The
-    # reload moves the caret to the field's end, so the restore below just re-pins that.
-    if not was_focused or source_updated:
-        # The field is blurred (Anki isn't frontmost). Re-assert it before pasting so the
-        # HTML lands in the intended field rather than nowhere.
-        window = _editor_window(editor)
-        if RAISE_ON_INSERT and window is not None:
-            window.activateWindow()
-            window.raise_()
-            raised_window = True
+    target_note_key = _note_key(getattr(editor, "note", None))
 
-        # Freeze the caret *first*, while the target field is still the active editable with
-        # the user's caret intact — focusField() below moves it to the field's end.
-        _inject_caret_helpers(editor)
-        editor.web.eval("window.__otaFreezeCaret && window.__otaFreezeCaret();")
+    def paste_and_finish(restored_caret: Any) -> None:
+        # On the blurred path this runs from a webview callback, so the editor has had a
+        # chance to move on — clicking another row in the Browse window swaps its note out
+        # from under us. Pasting then would dump the clip into a note the user never seeded.
+        if _note_key(getattr(editor, "note", None)) != target_note_key:
+            finish(
+                {
+                    "ok": False,
+                    "error": (
+                        "The editor loaded a different note before the paste landed. "
+                        "Nothing was inserted — click the target field again and retry."
+                    ),
+                }
+            )
+            return
+        finish(
+            {
+                "ok": True,
+                "field": getattr(editor, "currentField", field_idx),
+                "target_field_index": field_idx,
+                "from_memory": from_memory,
+                "was_focused": was_focused,
+                "raised_window": raised_window,
+                "source_updated": source_updated,
+                # True/False as reported by the webview, or None when no restore was needed.
+                "restored_caret": restored_caret,
+                "mode": getattr(editor, "editorMode", None)
+                and getattr(editor.editorMode, "name", str(editor.editorMode)),
+            },
+            commit=lambda: editor.doPaste(html, internal=False, extended=True),
+        )
 
-        try:
-            editor.web.setFocus()
-        except Exception:
-            pass
-        editor.currentField = field_idx
-        # focusField() places the caret at the *end* of the target field. It is queued
-        # before the paste eval, and the webview runs evals in submission order, so the
-        # paste lands in this field.
-        editor.web.eval(f"focusField({int(field_idx)});")
-        # Restore the frozen caret so the paste lands where the user's cursor was, not at
-        # the field's end. Best-effort: on failure the end-of-field caret from focusField()
-        # remains, which is the prior behaviour. We can't read the JS result synchronously
-        # (the webview shares this thread), so `restored_caret` reports the attempt, not a
-        # confirmed success — the paste position is the real signal.
-        editor.web.eval("window.__otaRestoreCaret && window.__otaRestoreCaret();")
-        restored_caret = True
+    # Already in the field with the caret live, and nothing disturbed it: paste straight in.
+    if was_focused and not source_updated:
+        paste_and_finish(None)
+        return
 
-    editor.doPaste(html, internal=False, extended=True)
-    return {
-        "ok": True,
-        "field": getattr(editor, "currentField", field_idx),
-        "target_field_index": field_idx,
-        "from_memory": from_memory,
-        "was_focused": was_focused,
-        "raised_window": raised_window,
-        "source_updated": source_updated,
-        "restored_caret": restored_caret,
-        "mode": getattr(editor, "editorMode", None)
-        and getattr(editor.editorMode, "name", str(editor.editorMode)),
-    }
+    # Otherwise the field is blurred (Anki isn't frontmost) or loadNote() just dropped focus.
+    # Re-assert it before pasting so the HTML lands in the intended field rather than nowhere.
+    window = _editor_window(editor)
+    if RAISE_ON_INSERT and window is not None:
+        window.activateWindow()
+        window.raise_()
+        raised_window = True
+
+    try:
+        editor.web.setFocus()
+    except Exception:
+        pass
+    editor.currentField = field_idx
+    # focusField() places the caret at the *end* of the target field. Evals run in submission
+    # order, so the restore below — and the paste it chains — land in this field.
+    editor.web.eval(f"focusField({int(field_idx)});")
+    # Restore the frozen caret so the paste lands where the user's cursor was, not at the
+    # field's end, and paste once the webview tells us how that went. On failure it reports
+    # false and focusField()'s end-of-field caret stands, which is the pre-caret behaviour.
+    editor.web.evalWithCallback(
+        "window.__otaRestoreCaret ? !!window.__otaRestoreCaret() : null",
+        paste_and_finish,
+    )
 
 
 def _guess_extension(suggested_name: str, data: bytes) -> str:
@@ -499,30 +543,61 @@ def _store_media_on_main(data: bytes, suggested_name: str) -> dict[str, Any]:
     return {"ok": True, "filename": stored}
 
 
-def _run_on_main_sync(func: Any, timeout: float = 5.0) -> dict[str, Any]:
+TIMED_OUT = {"ok": False, "error": "Timed out waiting for Anki's main thread."}
+
+
+def _run_on_main(func: Any, timeout: float = 5.0) -> dict[str, Any]:
+    """Run `func(finish)` on Anki's main thread and block this request thread until it calls
+    `finish(result)` — or until we give up.
+
+    `func` may complete asynchronously: /insert finishes from a webview eval callback, so
+    that it can report what the caret restore actually did instead of assuming it worked.
+
+    `finish(result, commit=...)` runs `commit` — the paste — only if it wins the race against
+    the timeout, and only once. Without that, a callback arriving just after we gave up would
+    paste behind the client's back: it has already been told the insert failed, so its retry
+    would insert the content a second time."""
+    lock = threading.Lock()
     done = threading.Event()
+    claimed = False
     result: dict[str, Any] = {}
 
-    def wrapped() -> None:
+    def claim() -> bool:
+        nonlocal claimed
+        with lock:
+            if claimed:
+                return False
+            claimed = True
+            return True
+
+    def finish(value: dict[str, Any], commit: Callable[[], None] | None = None) -> None:
         nonlocal result
+        if not claim():
+            return
+        if commit is not None:
+            try:
+                commit()
+            except Exception:
+                value = {"ok": False, "error": traceback.format_exc()}
+        result = value
+        done.set()
+
+    def wrapped() -> None:
         try:
-            result = func()
+            func(finish)
         except Exception:
-            result = {
-                "ok": False,
-                "error": traceback.format_exc(),
-            }
-        finally:
-            done.set()
+            finish({"ok": False, "error": traceback.format_exc()})
 
     aqt.mw.taskman.run_on_main(wrapped)
-    if not done.wait(timeout):
-        return {
-            "ok": False,
-            "error": "Timed out waiting for Anki's main thread.",
-        }
+    if done.wait(timeout):
+        return result
 
-    return result
+    # Out of time. Claim the completion ourselves so any late callback finds it taken and
+    # skips its commit. If we lose that race the callback is already committing, so wait
+    # briefly for the result it is about to publish rather than reporting a false failure.
+    if claim():
+        return dict(TIMED_OUT)
+    return result if done.wait(1.0) else dict(TIMED_OUT)
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -588,11 +663,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length)
         if parsed.path == "/media":
             name = parse_qs(parsed.query).get("name", [""])[0]
-            result = _run_on_main_sync(lambda: _store_media_on_main(body, name))
+            result = _run_on_main(lambda finish: finish(_store_media_on_main(body, name)))
         else:
             html = body.decode("utf8")
             source_url = parse_qs(parsed.query).get("source_url", [""])[0] or None
-            result = _run_on_main_sync(lambda: _insert_html_on_main(html, source_url))
+            result = _run_on_main(lambda finish: _insert_html_on_main(html, source_url, finish))
         status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
         self._send_json(status, result)
 
