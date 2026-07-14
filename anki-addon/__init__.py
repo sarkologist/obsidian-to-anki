@@ -453,14 +453,22 @@ def _insert_html_on_main(
         editor.currentField = field_idx
         source_updated = True
 
+    target_note_key = _note_key(getattr(editor, "note", None))
+
     def paste_and_finish(restored_caret: Any) -> None:
-        # Runs from a webview callback on the blurred path, so it is outside _run_on_main's
-        # try/except: swallow nothing, or the request would hang until its timeout and blame
-        # the main thread for what was really a paste failure.
-        try:
-            editor.doPaste(html, internal=False, extended=True)
-        except Exception:
-            finish({"ok": False, "error": traceback.format_exc()})
+        # On the blurred path this runs from a webview callback, so the editor has had a
+        # chance to move on — clicking another row in the Browse window swaps its note out
+        # from under us. Pasting then would dump the clip into a note the user never seeded.
+        if _note_key(getattr(editor, "note", None)) != target_note_key:
+            finish(
+                {
+                    "ok": False,
+                    "error": (
+                        "The editor loaded a different note before the paste landed. "
+                        "Nothing was inserted — click the target field again and retry."
+                    ),
+                }
+            )
             return
         finish(
             {
@@ -475,7 +483,8 @@ def _insert_html_on_main(
                 "restored_caret": restored_caret,
                 "mode": getattr(editor, "editorMode", None)
                 and getattr(editor.editorMode, "name", str(editor.editorMode)),
-            }
+            },
+            commit=lambda: editor.doPaste(html, internal=False, extended=True),
         )
 
     # Already in the field with the caret live, and nothing disturbed it: paste straight in.
@@ -534,21 +543,42 @@ def _store_media_on_main(data: bytes, suggested_name: str) -> dict[str, Any]:
     return {"ok": True, "filename": stored}
 
 
-def _run_on_main(
-    func: Callable[[Callable[[dict[str, Any]], None]], None], timeout: float = 5.0
-) -> dict[str, Any]:
-    """Run `func(finish)` on Anki's main thread and block this request thread until it calls
-    `finish(result)`.
+TIMED_OUT = {"ok": False, "error": "Timed out waiting for Anki's main thread."}
 
-    `func` may complete asynchronously — /insert finishes from a webview eval callback, so
-    that it can report what the caret restore actually did instead of assuming it worked."""
+
+def _run_on_main(func: Any, timeout: float = 5.0) -> dict[str, Any]:
+    """Run `func(finish)` on Anki's main thread and block this request thread until it calls
+    `finish(result)` — or until we give up.
+
+    `func` may complete asynchronously: /insert finishes from a webview eval callback, so
+    that it can report what the caret restore actually did instead of assuming it worked.
+
+    `finish(result, commit=...)` runs `commit` — the paste — only if it wins the race against
+    the timeout, and only once. Without that, a callback arriving just after we gave up would
+    paste behind the client's back: it has already been told the insert failed, so its retry
+    would insert the content a second time."""
+    lock = threading.Lock()
     done = threading.Event()
+    claimed = False
     result: dict[str, Any] = {}
 
-    def finish(value: dict[str, Any]) -> None:
+    def claim() -> bool:
+        nonlocal claimed
+        with lock:
+            if claimed:
+                return False
+            claimed = True
+            return True
+
+    def finish(value: dict[str, Any], commit: Callable[[], None] | None = None) -> None:
         nonlocal result
-        if done.is_set():
+        if not claim():
             return
+        if commit is not None:
+            try:
+                commit()
+            except Exception:
+                value = {"ok": False, "error": traceback.format_exc()}
         result = value
         done.set()
 
@@ -559,13 +589,15 @@ def _run_on_main(
             finish({"ok": False, "error": traceback.format_exc()})
 
     aqt.mw.taskman.run_on_main(wrapped)
-    if not done.wait(timeout):
-        return {
-            "ok": False,
-            "error": "Timed out waiting for Anki's main thread.",
-        }
+    if done.wait(timeout):
+        return result
 
-    return result
+    # Out of time. Claim the completion ourselves so any late callback finds it taken and
+    # skips its commit. If we lose that race the callback is already committing, so wait
+    # briefly for the result it is about to publish rather than reporting a false failure.
+    if claim():
+        return dict(TIMED_OUT)
+    return result if done.wait(1.0) else dict(TIMED_OUT)
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
