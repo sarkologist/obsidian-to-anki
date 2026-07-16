@@ -74,6 +74,14 @@ Confirms the paste lands where your cursor was, not appended at the end.
    means the freeze/restore didn't take (older Anki without `anki/location`, or a resolve
    failure) and it fell back to end-of-field.
 
+## Test D — Add window wins over Browser editor
+
+1. Open both Anki's Add window and Browser editor, and click a field in each.
+2. Click the target field in the Add window last, then switch directly to Obsidian.
+3. Send a selection to Anki.
+4. **Pass:** the selection appears in the Add window field. **Fail:** it appears in the
+   Browser editor because both editors retained a stale `currentField` value.
+
 ## Test B — fallback with window raise
 
 If Test A pastes nowhere, the webview likely won't accept focus while hidden. Retry with
