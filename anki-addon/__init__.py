@@ -326,8 +326,8 @@ def _editor_score(editor: Any) -> tuple[int, int, int, int, int]:
 
     window = _editor_window(editor)
     return (
-        int(getattr(editor, "currentField", None) is not None),
         int(_is_focus_inside(editor)),
+        int(getattr(editor, "currentField", None) is not None),
         int(bool(window and window.isActiveWindow())),
         int(editor.web.isVisible()),
         int(bool(window and window.isVisible())),
@@ -345,6 +345,10 @@ def _active_editor() -> Any | None:
 
     candidates.sort(key=_editor_score, reverse=True)
     best = candidates[0]
+    # currentField is not proof of live focus: Anki can leave it populated in several
+    # editors after the user switches to Obsidian. Treating that stale value as active
+    # makes the WeakSet iteration order decide between Add and Browser, overwriting the
+    # real last-focus memory. Only a field whose webview actually owns Qt focus is live.
     if _editor_score(best)[0] <= 0:
         return None
     _remember_focus(best)
