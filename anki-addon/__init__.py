@@ -154,6 +154,12 @@ _CARET_JS = r"""
   // an empty <span> doesn't, and Chromium normalises the caret straight past it and inserts
   // on the far side. It also survives the block re-shuffling a multi-block paste triggers,
   // where a marker text node gets merged away.
+  //
+  // block="true" is Anki's own "treat this as a block element" opt-in (elementIsBlock). Anki
+  // cleans up a heading the paste wrapped around blocks, and that check bails on any
+  // non-block child: an unmarked bookmark inside the heading suppresses the cleanup, leaving
+  // an empty <h1> behind once the bookmark is removed. Nothing styles the attribute, so the
+  // bookmark stays inline for caret purposes.
   window.__otaMarkInsertEnd = function () {
     var ed = editable();
     if (!ed) { return false; }
@@ -164,6 +170,7 @@ _CARET_JS = r"""
     dropMarkers(ed);
     var marker = document.createElement("img");
     marker.setAttribute(MARKER_ATTR, "1");
+    marker.setAttribute("block", "true");
     var collapsed = range.collapsed;
     var end = range.cloneRange();
     end.collapse(false);
