@@ -49,10 +49,21 @@ RAISE_ON_INSERT = os.environ.get("BRIDGE_RAISE_ON_INSERT") == "1"
 # Everything is best-effort and guarded: if the location package is missing (older Anki) or
 # the coordinates no longer resolve, the helpers return false and we fall back to Anki's
 # end-of-field behaviour. Idempotent: re-injecting is a no-op after the first run.
+#
+# The same script also leaves the caret *after* the inserted content. Anki's paste is
+# execCommand("insertHTML") followed by DOM surgery (decorating MathJax, unwrapping headings
+# the paste wrapped around blocks); when the surgery re-creates the last inserted node the
+# browser's post-insert caret dies with it and collapses back to the insertion point, so the
+# caret ends up in front of the paste — type, and what you type lands before what you just
+# sent over. We bookmark the end of the paste target before pasting and move the caret onto
+# the bookmark afterwards, which survives that surgery.
 _CARET_JS = r"""
 (function () {
   if (window.__otaCaretHook) { return; }
   window.__otaCaretHook = true;
+
+  var MARKER_ATTR = "data-ota-insert-marker";
+  var MARKER_SELECTOR = "[" + MARKER_ATTR + "]";
 
   // The focused rich-text editable, mirroring Anki's activeRichTextEditable(): it is
   // either document.activeElement itself or one shadow level down (the RichTextInput host).
@@ -121,6 +132,95 @@ _CARET_JS = r"""
     var l = loc();
     if (!l) { return false; }
     try { l.restoreSelection(ed, saved); return true; } catch (e) { return false; }
+  };
+
+  function selectionFor(ed) {
+    var root = ed.getRootNode();
+    return root.getSelection ? root.getSelection() : document.getSelection();
+  }
+
+  function dropMarkers(ed) {
+    var stale = ed.querySelectorAll(MARKER_SELECTOR);
+    for (var i = 0; i < stale.length; i++) { stale[i].remove(); }
+  }
+
+  // Bookmark where the pasted content will end, by parking a node at the end of the paste
+  // target and pointing the selection just before it: execCommand("insertHTML") then inserts
+  // in front of the bookmark, so afterwards the bookmark sits exactly where the caret
+  // belongs.
+  //
+  // The bookmark is a src-less <img> on purpose. It renders nothing (no source, no broken
+  // icon, zero size) but is a replaced element, so it occupies a caret position of its own —
+  // an empty <span> doesn't, and Chromium normalises the caret straight past it and inserts
+  // on the far side. It also survives the block re-shuffling a multi-block paste triggers,
+  // where a marker text node gets merged away.
+  window.__otaMarkInsertEnd = function () {
+    var ed = editable();
+    if (!ed) { return false; }
+    var sel = selectionFor(ed);
+    if (!sel || sel.rangeCount === 0) { return false; }
+    var range = sel.getRangeAt(0);
+    if (!ed.contains(range.commonAncestorContainer)) { return false; }
+    dropMarkers(ed);
+    var marker = document.createElement("img");
+    marker.setAttribute(MARKER_ATTR, "1");
+    var collapsed = range.collapsed;
+    var end = range.cloneRange();
+    end.collapse(false);
+    try {
+      end.insertNode(marker);
+      // Keep the original target — including a non-collapsed selection, which the paste is
+      // supposed to replace — now bounded by the bookmark. A plain caret must stay
+      // *collapsed*: insertNode splits the text node around it, and a range spanning that
+      // (empty) split reaches execCommand as a selection to replace, which throws its own
+      // caret handling off.
+      if (collapsed) {
+        range.setStartBefore(marker);
+        range.collapse(true);
+      } else {
+        range.setEndBefore(marker);
+      }
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (e) {
+      marker.remove();
+      return false;
+    }
+    window.__otaMarkerEditable = ed;
+    return true;
+  };
+
+  // Put the caret where the bookmark sits (i.e. after the inserted content) and remove it.
+  // Always call this after a marked paste, even if the paste failed, so no bookmark is left
+  // behind in the field.
+  window.__otaCaretAfterInsert = function () {
+    var ed = window.__otaMarkerEditable;
+    window.__otaMarkerEditable = null;
+    if (!ed) { return false; }
+    var marker = ed.querySelector(MARKER_SELECTOR);
+    if (!marker) { return false; }
+    var parent = marker.parentNode;
+    var index = Array.prototype.indexOf.call(parent.childNodes, marker);
+    dropMarkers(ed);
+    var ok = false;
+    try {
+      var range = document.createRange();
+      range.setStart(parent, index);
+      range.collapse(true);
+      var sel = selectionFor(ed);
+      if (sel) {
+        sel.removeAllRanges();
+        sel.addRange(range);
+        ok = true;
+      }
+    } catch (e) {}
+    // The editor's field save is debounced and captures the HTML as it was mid-paste, which
+    // included the bookmark. Nudge it to re-read the now-clean field so the bookmark can't
+    // be written to the note.
+    try {
+      ed.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
+    } catch (e) {}
+    return ok;
   };
 })();
 """
@@ -381,6 +481,21 @@ def _append_source_field(note: Any, source_url: str) -> bool:
     return True
 
 
+def _paste_leaving_caret_after(editor: Any, html: str) -> None:
+    """Paste `html`, leaving the caret after the inserted content rather than in front of it.
+
+    Bookmark the end of the paste target first, then hand the caret back to the bookmark once
+    the paste — and Anki's post-paste DOM surgery — is done. The clean-up eval runs even if
+    doPaste raises, so a failed paste can't strand the bookmark in the field. Both evals are
+    guarded on the helper existing: an editor webview still running an older injection just
+    keeps Anki's own caret."""
+    editor.web.eval("window.__otaMarkInsertEnd && window.__otaMarkInsertEnd();")
+    try:
+        editor.doPaste(html, internal=False, extended=True)
+    finally:
+        editor.web.eval("window.__otaCaretAfterInsert && window.__otaCaretAfterInsert();")
+
+
 def _insert_html_on_main(
     html: str, source_url: str | None, finish: Callable[[dict[str, Any]], None]
 ) -> None:
@@ -484,7 +599,7 @@ def _insert_html_on_main(
                 "mode": getattr(editor, "editorMode", None)
                 and getattr(editor.editorMode, "name", str(editor.editorMode)),
             },
-            commit=lambda: editor.doPaste(html, internal=False, extended=True),
+            commit=lambda: _paste_leaving_caret_after(editor, html),
         )
 
     # Already in the field with the caret live, and nothing disturbed it: paste straight in.

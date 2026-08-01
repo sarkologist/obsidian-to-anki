@@ -37,6 +37,11 @@ Restart Anki to load the new code. Re-run the script (and restart) after each ch
   real caret (via `require("anki/location").saveSelection`) **before it touches the editor at
   all**, and restores it just before pasting. Best-effort: if the location package is
   unavailable or the coordinates no longer resolve, it falls back to end-of-field.
+- After the insert the **caret sits after what was inserted**, so you can keep typing where
+  the pasted content ends. Anki's own paste doesn't guarantee that: it re-decorates MathJax
+  and unwraps headings *after* `execCommand("insertHTML")`, and re-creating the last inserted
+  node drops the caret back in front of the paste. The addon bookmarks the end of the paste
+  target first and puts the caret on the bookmark once the paste settles.
 - The `/insert` response includes diagnostics: `from_memory`, `was_focused`,
   `target_field_index`, `raised_window`, `source_updated`, and `restored_caret` — the value
   the webview actually reported (`true`/`false`), or `null` when no restore was needed
@@ -95,6 +100,18 @@ before that runs, not after.
 This hides in the Add window: there the first paste — the one that appends the link and
 triggers the reload — usually goes into an *empty* field, where "end of field" and "at the
 caret" are the same place.
+
+## Test E — the caret ends up after the insert
+
+Confirms you can carry on typing from the end of what was just inserted.
+
+1. Open the Add window, click into a field and type `foobar`, caret between `foo` and `bar`.
+2. Switch to another app.
+3. Send a selection containing **math**, e.g. `$x^2$` in Obsidian (plain text won't catch the
+   regression — only content Anki re-decorates after the paste does).
+4. Switch back to Anki and type `Z` without clicking anywhere.
+5. **Pass:** `Z` sits between the rendered math and `bar`. **Fail:** the field reads
+   `fooZ<math>bar` — the caret was left in front of the insert.
 
 ## Test B — fallback with window raise
 
