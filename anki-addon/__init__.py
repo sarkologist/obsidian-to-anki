@@ -161,12 +161,13 @@ _CARET_JS = r"""
   // an empty <h1> behind once the bookmark is removed. Nothing styles the attribute, so the
   // bookmark stays inline for caret purposes.
   window.__otaMarkInsertEnd = function () {
+    function bail(why) { window.__otaMarkOutcome = why; return false; }
     var ed = editable();
-    if (!ed) { return false; }
+    if (!ed) { return bail("no-editable"); }
     var sel = selectionFor(ed);
-    if (!sel || sel.rangeCount === 0) { return false; }
+    if (!sel || sel.rangeCount === 0) { return bail("no-selection"); }
     var range = sel.getRangeAt(0);
-    if (!ed.contains(range.commonAncestorContainer)) { return false; }
+    if (!ed.contains(range.commonAncestorContainer)) { return bail("selection-outside-field"); }
     dropMarkers(ed);
     var marker = document.createElement("img");
     marker.setAttribute(MARKER_ATTR, "1");
@@ -191,25 +192,31 @@ _CARET_JS = r"""
       sel.addRange(range);
     } catch (e) {
       marker.remove();
-      return false;
+      return bail("insert-threw");
     }
     window.__otaMarkerEditable = ed;
+    window.__otaMarkOutcome = "ok";
     return true;
   };
 
   // Put the caret where the bookmark sits (i.e. after the inserted content) and remove it.
   // Always call this after a marked paste, even if the paste failed, so no bookmark is left
-  // behind in the field.
+  // behind in the field. Returns a diagnostic the add-on reports on /health — where the caret
+  // ends up is invisible from Python, so without this a caret that lands in the wrong place
+  // gives no clue which step gave up.
   window.__otaCaretAfterInsert = function () {
+    var diag = {marked: window.__otaMarkOutcome || null};
+    function done(why) { diag.caret = why; window.__otaLastInsert = diag; return diag; }
     var ed = window.__otaMarkerEditable;
     window.__otaMarkerEditable = null;
-    if (!ed) { return false; }
+    window.__otaMarkOutcome = null;
+    if (!ed) { return done("no-bookmarked-field"); }
     var marker = ed.querySelector(MARKER_SELECTOR);
-    if (!marker) { return false; }
+    if (!marker) { return done("bookmark-vanished"); }
     var parent = marker.parentNode;
     var index = Array.prototype.indexOf.call(parent.childNodes, marker);
     dropMarkers(ed);
-    var ok = false;
+    var outcome = "no-selection";
     try {
       var range = document.createRange();
       range.setStart(parent, index);
@@ -218,16 +225,18 @@ _CARET_JS = r"""
       if (sel) {
         sel.removeAllRanges();
         sel.addRange(range);
-        ok = true;
+        outcome = "ok";
       }
-    } catch (e) {}
+    } catch (e) {
+      outcome = "threw";
+    }
     // The editor's field save is debounced and captures the HTML as it was mid-paste, which
     // included the bookmark. Nudge it to re-read the now-clean field so the bookmark can't
     // be written to the note.
     try {
       ed.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
     } catch (e) {}
-    return ok;
+    return done(outcome);
   };
 })();
 """
@@ -260,6 +269,10 @@ _token = secrets.token_urlsafe(32)
 _last_focus_ref: "weakref.ref[Any] | None" = None
 _last_focus_field: int | None = None
 _last_focus_note_key: tuple[Any, Any, Any] | None = None
+
+# What the caret bookmark did on the last paste, reported on /health. Filled from a webview
+# callback that lands after /insert has already replied.
+_last_insert_caret: dict[str, Any] = {}
 
 
 def _note_key(note: Any) -> tuple[Any, Any, Any] | None:
@@ -495,12 +508,27 @@ def _paste_leaving_caret_after(editor: Any, html: str) -> None:
     the paste — and Anki's post-paste DOM surgery — is done. The clean-up eval runs even if
     doPaste raises, so a failed paste can't strand the bookmark in the field. Both evals are
     guarded on the helper existing: an editor webview still running an older injection just
-    keeps Anki's own caret."""
+    keeps Anki's own caret.
+
+    The clean-up reports which step (if any) gave up, into `_last_insert_caret` for /health.
+    The response is already sent by then — this runs from the paste commit — so it can't ride
+    along on /insert, but where the caret lands is invisible from Python and a bad landing is
+    otherwise silent."""
     editor.web.eval("window.__otaMarkInsertEnd && window.__otaMarkInsertEnd();")
     try:
         editor.doPaste(html, internal=False, extended=True)
     finally:
-        editor.web.eval("window.__otaCaretAfterInsert && window.__otaCaretAfterInsert();")
+
+        def record(value: Any) -> None:
+            _last_insert_caret.clear()
+            _last_insert_caret.update(
+                value if isinstance(value, dict) else {"caret": "helpers-missing"}
+            )
+
+        editor.web.evalWithCallback(
+            "window.__otaCaretAfterInsert ? window.__otaCaretAfterInsert() : null",
+            record,
+        )
 
 
 def _insert_html_on_main(
@@ -749,7 +777,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False})
             return
 
-        self._send_json(HTTPStatus.OK, {"ok": True})
+        # last_insert_caret says what the caret bookmark did on the most recent paste — the
+        # only window Python has into where the caret actually ended up.
+        self._send_json(
+            HTTPStatus.OK, {"ok": True, "last_insert_caret": dict(_last_insert_caret)}
+        )
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
