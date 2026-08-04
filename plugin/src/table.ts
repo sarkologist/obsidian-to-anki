@@ -71,6 +71,30 @@ function isDelimiter(line: string | undefined): boolean {
   return cells.every((cell) => /^\s*:?-+:?\s*$/.test(cell));
 }
 
+const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/**
+ * Is `line` inside a fenced code block? A note that documents Markdown has table-shaped
+ * lines in its fences, and those are text the user meant literally — completing them into a
+ * table would send rendered HTML where code was selected. Only a fence of the same
+ * character and at least the same length closes one, and a closing fence carries no info
+ * string, so ```` ```md ```` inside a ``~~~`` block doesn't end it.
+ */
+function insideCodeFence(editor: EditorLines, line: number): boolean {
+  let open: { char: string; length: number } | null = null;
+  for (let i = 0; i < line; i += 1) {
+    const match = FENCE.exec(editor.getLine(i));
+    if (!match) continue;
+    const [, marker, rest] = match;
+    if (!open) {
+      open = { char: marker[0], length: marker.length };
+    } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === "") {
+      open = null;
+    }
+  }
+  return open !== null;
+}
+
 export interface Table {
   headerLine: number;
   delimiterLine: number;
@@ -101,6 +125,7 @@ function lineOfRow(table: Table, row: number): number {
 export function findTable(editor: EditorLines, line: number): Table | null {
   const lastLine = editor.lastLine();
   if (line < 0 || line > lastLine || !isRow(editor.getLine(line))) return null;
+  if (insideCodeFence(editor, line)) return null;
 
   let top = line;
   while (top > 0 && isRow(editor.getLine(top - 1))) top -= 1;
