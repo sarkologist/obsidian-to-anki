@@ -69,25 +69,33 @@ interface Table {
 }
 
 /**
- * The table containing `line`, or null if it isn't in one. A table is a contiguous run of
- * row-ish lines — a blank line or ordinary prose ends it — whose first two lines are the
- * header and its delimiter. Finding the run's top rather than stopping at the first
- * delimiter-looking line above matters: a body row of literal dashes (`| --- | --- |`) is
- * itself delimiter-shaped, and stopping there would take the row above it as the header.
+ * The table containing `line`, or null if it isn't in one. A table lives in a contiguous
+ * run of row-ish lines — a blank line or prose without a pipe ends it — and is anchored on
+ * the *first* delimiter row in that run, with the line above it as its header.
+ *
+ * Anchoring on the first delimiter in the whole run, rather than the first one found while
+ * walking up from the selection, matters in both directions: a body row of literal dashes
+ * (`| --- | --- |`) is itself delimiter-shaped and would otherwise pose as the delimiter,
+ * while a paragraph line that happens to contain a pipe, sitting directly above the table
+ * with no blank line, would otherwise be absorbed and tested as the header.
  */
 function findTable(editor: EditorLines, line: number): Table | null {
   const lastLine = editor.lastLine();
   if (line < 0 || line > lastLine || !isRow(editor.getLine(line))) return null;
 
-  let headerLine = line;
-  while (headerLine > 0 && isRow(editor.getLine(headerLine - 1))) headerLine -= 1;
-
-  const delimiterLine = headerLine + 1;
-  if (delimiterLine > lastLine) return null;
-  if (isDelimiter(editor.getLine(headerLine)) || !isDelimiter(editor.getLine(delimiterLine))) return null;
-
-  let lastRowLine = delimiterLine;
+  let top = line;
+  while (top > 0 && isRow(editor.getLine(top - 1))) top -= 1;
+  let lastRowLine = line;
   while (lastRowLine < lastLine && isRow(editor.getLine(lastRowLine + 1))) lastRowLine += 1;
+
+  let delimiterLine = top + 1;
+  while (delimiterLine <= lastRowLine && !isDelimiter(editor.getLine(delimiterLine))) delimiterLine += 1;
+  if (delimiterLine > lastRowLine) return null;
+
+  const headerLine = delimiterLine - 1;
+  if (isDelimiter(editor.getLine(headerLine))) return null;
+  // The selection started in whatever preceded the table, not in the table itself.
+  if (line < headerLine) return null;
 
   return { headerLine, delimiterLine, lastRowLine };
 }
