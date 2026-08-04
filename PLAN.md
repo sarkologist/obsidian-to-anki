@@ -30,7 +30,13 @@ Operates on the current selection only; no selection → no-op with a toast.
 
 **Pipeline** (order matters):
 
-1. Grab the raw selected Markdown from the active editor.
+1. Grab the raw selected Markdown from the active editor. A selection that starts inside a
+   table's body is completed first — its header and `|---|` delimiter rows are prepended and
+   half-covered rows widened to whole lines — since a few rows on their own are not a table
+   to any Markdown parser. Live Preview needs a second path: dragging across table cells
+   there uses Obsidian's own cell-range selection, which never reaches the editor API (the
+   document selection stays in the anchor cell), so the highlighted rectangle is read off
+   the rendered table via its `is-selected` cells and mapped back to source lines.
 2. **Protect math first**, before any HTML rendering. Scan for `$…$` / `$$…$$`
    (skipping code spans/fences), replace each with a placeholder, and classify:
    - inline → `\(…\)`
