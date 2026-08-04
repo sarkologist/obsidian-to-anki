@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
-import { selectionMarkdown } from "./table";
+import { findTable, selectionMarkdown, tableRectangleMarkdown, tableRowCount } from "./table";
 
 /**
  * Send the current Markdown selection into the focused Anki editor field. Renders via
@@ -68,7 +68,10 @@ export default class ObsidianToAnkiPlugin extends Plugin {
       id: "send-selection-to-anki",
       name: "Send selection to Anki",
       editorCheckCallback: (checking, editor, view) => {
-        const hasSelection = editor.getSelection().trim().length > 0;
+        // A Live Preview cell selection leaves the document selection inside the anchor
+        // cell, but it can also be empty — the command still has something to send.
+        const hasSelection =
+          editor.getSelection().trim().length > 0 || cellRectangle(view as MarkdownView) !== null;
         if (checking) return hasSelection;
         void this.sendSelection(editor, view as MarkdownView);
         return true;
@@ -79,13 +82,11 @@ export default class ObsidianToAnkiPlugin extends Plugin {
   }
 
   private async sendSelection(editor: Editor, view: MarkdownView): Promise<void> {
-    if (!editor.getSelection().trim()) {
+    const markdown = this.selectedMarkdown(editor, view);
+    if (!markdown.trim()) {
       new Notice("Obsidian → Anki: nothing selected.");
       return;
     }
-    // Not editor.getSelection(): a few rows out of a table need their header and delimiter
-    // row put back, or they render as a paragraph of literal pipes.
-    const markdown = selectionMarkdown(editor, editor.getCursor("from"), editor.getCursor("to"));
 
     let html: string;
     try {
@@ -103,6 +104,34 @@ export default class ObsidianToAnkiPlugin extends Plugin {
     } catch (err) {
       new Notice(`Obsidian → Anki: send failed — ${errorMessage(err)}`);
     }
+  }
+
+  /**
+   * The Markdown the user picked. Both ways of selecting part of a table need the header
+   * and delimiter rows put back, or Anki receives a paragraph of literal pipes: an ordinary
+   * text selection carries its own range, while a Live Preview cell selection has to be
+   * read off the rendered table because the editor only sees the anchor cell.
+   */
+  private selectedMarkdown(editor: Editor, view: MarkdownView): string {
+    const rect = cellRectangle(view);
+    if (rect) {
+      const table = findTable(editor, editor.getCursor("from").line);
+      // Only trust the rendered rectangle against the table the cursor is actually in, and
+      // only when the two agree on how many rows that table has.
+      if (table && tableRowCount(table) === rect.rowCount) {
+        const columns =
+          rect.firstCol === 0 && rect.lastCol === rect.colCount - 1
+            ? null // every column: send the rows exactly as written
+            : { first: rect.firstCol, last: rect.lastCol };
+        return tableRectangleMarkdown(
+          editor,
+          table,
+          { first: rect.firstRow, last: rect.lastRow },
+          columns,
+        );
+      }
+    }
+    return selectionMarkdown(editor, editor.getCursor("from"), editor.getCursor("to"));
   }
 
   /**
@@ -338,6 +367,55 @@ export default class ObsidianToAnkiPlugin extends Plugin {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+interface CellRectangle {
+  firstRow: number;
+  lastRow: number;
+  firstCol: number;
+  lastCol: number;
+  /** Shape of the rendered table, for cross-checking against the table parsed from source. */
+  rowCount: number;
+  colCount: number;
+}
+
+/**
+ * The rectangle of cells Obsidian's Live Preview table editor has selected, or null if
+ * there is none. Obsidian keeps that selection to itself: `selectCells()` marks the chosen
+ * cells with `is-selected` and leaves the *document* selection sitting in the anchor cell,
+ * so the editor reports a single row however many are highlighted. The rendered table is
+ * the only place the real extent shows up. (Selecting one cell doesn't count as a
+ * rectangle — Obsidian marks nothing, and that's an ordinary text selection anyway.)
+ */
+function cellRectangle(view: MarkdownView): CellRectangle | null {
+  const cells = Array.from(
+    view?.contentEl?.querySelectorAll<HTMLTableCellElement>(
+      "table td.is-selected, table th.is-selected",
+    ) ?? [],
+  );
+  if (cells.length === 0) return null;
+  const table = cells[0].closest<HTMLTableElement>("table");
+  if (!table) return null;
+
+  let firstRow = Number.POSITIVE_INFINITY;
+  let lastRow = Number.NEGATIVE_INFINITY;
+  let firstCol = Number.POSITIVE_INFINITY;
+  let lastCol = Number.NEGATIVE_INFINITY;
+  for (const cell of cells) {
+    // Selected cells spread over two tables would be someone else's `is-selected`; the
+    // mapping back to source lines only holds within one table, so don't guess.
+    if (cell.closest("table") !== table) return null;
+    const row = cell.parentElement as HTMLTableRowElement | null;
+    if (!row) return null;
+    firstRow = Math.min(firstRow, row.rowIndex);
+    lastRow = Math.max(lastRow, row.rowIndex);
+    firstCol = Math.min(firstCol, cell.cellIndex);
+    lastCol = Math.max(lastCol, cell.cellIndex);
+  }
+
+  const colCount = table.rows[0]?.cells.length ?? 0;
+  if (!Number.isFinite(firstRow) || firstRow < 0 || colCount === 0) return null;
+  return { firstRow, lastRow, firstCol, lastCol, rowCount: table.rows.length, colCount };
 }
 
 /**

@@ -16,6 +16,15 @@
  *
  * The rows themselves are handed over verbatim, so whatever they contain — math, images,
  * links — flows through the rest of the pipeline as usual.
+ *
+ * Two ways to select part of a table, and they need different handling:
+ *
+ * - In Source mode (or dragging past a table in Live Preview) it's an ordinary text
+ *   selection, and the editor's own range says what was picked — `selectionMarkdown`.
+ * - Inside a Live Preview table, Obsidian runs its own cell-range selection instead. The
+ *   document selection stays in the anchor cell, so the editor reports one row no matter
+ *   how many are highlighted; the caller reads the real rectangle out of the rendered
+ *   table and asks for it by row/column index — `tableRectangleMarkdown`.
  */
 
 export interface Pos {
@@ -62,10 +71,20 @@ function isDelimiter(line: string | undefined): boolean {
   return cells.every((cell) => /^\s*:?-+:?\s*$/.test(cell));
 }
 
-interface Table {
+export interface Table {
   headerLine: number;
   delimiterLine: number;
   lastRowLine: number;
+}
+
+/** How many rows the table renders as: its header, plus every body row. */
+export function tableRowCount(table: Table): number {
+  return table.lastRowLine - table.headerLine;
+}
+
+/** The source line of a rendered row, counting the header as row 0 (as the DOM does). */
+function lineOfRow(table: Table, row: number): number {
+  return row === 0 ? table.headerLine : table.delimiterLine + row;
 }
 
 /**
@@ -79,7 +98,7 @@ interface Table {
  * while a paragraph line that happens to contain a pipe, sitting directly above the table
  * with no blank line, would otherwise be absorbed and tested as the header.
  */
-function findTable(editor: EditorLines, line: number): Table | null {
+export function findTable(editor: EditorLines, line: number): Table | null {
   const lastLine = editor.lastLine();
   if (line < 0 || line > lastLine || !isRow(editor.getLine(line))) return null;
 
@@ -139,4 +158,68 @@ export function selectionMarkdown(editor: EditorLines, from: Pos, to: Pos): stri
   if (start.line === table.delimiterLine) return `${header}\n${body}`;
   if (end.line < table.delimiterLine) return `${body}\n${delimiter}`; // the header row alone
   return body;
+}
+
+interface SplitRow {
+  /** Any `>` quoting the row carries, so a sliced row stays inside its callout. */
+  prefix: string;
+  cells: string[];
+}
+
+/**
+ * A row's cells. GFM splits on every pipe that isn't backslash-escaped — one inside a code
+ * span or a math span still separates cells — so this needs no notion of either.
+ */
+function splitRow(line: string): SplitRow {
+  const prefix = /^\s*(?:>\s*)*/.exec(line)?.[0] ?? "";
+  const text = line.slice(prefix.length).trim();
+  const cells: string[] = [];
+  let cell = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "\\" && i + 1 < text.length) {
+      cell += char + text[i + 1];
+      i += 1;
+    } else if (char === "|") {
+      cells.push(cell);
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell);
+  // The outer pipes are optional in GFM; where they are present they leave an empty cell.
+  if (text.startsWith("|")) cells.shift();
+  if (cells.length > 0 && text.endsWith("|") && cells[cells.length - 1].trim() === "") cells.pop();
+  return { prefix, cells: cells.map((c) => c.trim()) };
+}
+
+/**
+ * The rows `first`..`last` of `table` as a table of their own, header and delimiter
+ * included, counting the header as row 0. `columns` narrows every row to that span of
+ * cells; null keeps each row exactly as written.
+ *
+ * This is the Live Preview path: Obsidian's own cell-range selection is invisible to the
+ * editor's document selection, so the caller reads the rectangle out of the rendered table
+ * and names it by index.
+ */
+export function tableRectangleMarkdown(
+  editor: EditorLines,
+  table: Table,
+  rows: { first: number; last: number },
+  columns: { first: number; last: number } | null,
+): string {
+  const take = (line: number): string => {
+    const text = editor.getLine(line);
+    if (!columns) return text;
+    const { prefix, cells } = splitRow(text);
+    return `${prefix}| ${cells.slice(columns.first, columns.last + 1).join(" | ")} |`;
+  };
+
+  const out = [take(table.headerLine), take(table.delimiterLine)];
+  // Row 0 is the header, already emitted; body rows start at 1.
+  for (let row = Math.max(rows.first, 1); row <= rows.last; row += 1) {
+    out.push(take(lineOfRow(table, row)));
+  }
+  return out.join("\n");
 }
