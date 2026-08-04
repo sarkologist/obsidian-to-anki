@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 import { MATH_PLACEHOLDER_ATTR, delimit, extractMath } from "./math";
+import { selectionMarkdown } from "./table";
 
 /**
  * Send the current Markdown selection into the focused Anki editor field. Renders via
@@ -78,11 +79,13 @@ export default class ObsidianToAnkiPlugin extends Plugin {
   }
 
   private async sendSelection(editor: Editor, view: MarkdownView): Promise<void> {
-    const markdown = editor.getSelection();
-    if (!markdown.trim()) {
+    if (!editor.getSelection().trim()) {
       new Notice("Obsidian → Anki: nothing selected.");
       return;
     }
+    // Not editor.getSelection(): a few rows out of a table need their header and delimiter
+    // row put back, or they render as a paragraph of literal pipes.
+    const markdown = selectionMarkdown(editor, editor.getCursor("from"), editor.getCursor("to"));
 
     let html: string;
     try {

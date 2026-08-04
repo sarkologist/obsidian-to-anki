@@ -30,7 +30,10 @@ Operates on the current selection only; no selection → no-op with a toast.
 
 **Pipeline** (order matters):
 
-1. Grab the raw selected Markdown from the active editor.
+1. Grab the raw selected Markdown from the active editor. A selection that starts inside a
+   table's body is completed first — its header and `|---|` delimiter rows are prepended and
+   half-covered rows widened to whole lines — since a few rows on their own are not a table
+   to any Markdown parser.
 2. **Protect math first**, before any HTML rendering. Scan for `$…$` / `$$…$$`
    (skipping code spans/fences), replace each with a placeholder, and classify:
    - inline → `\(…\)`

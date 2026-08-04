@@ -37,4 +37,8 @@ For live iteration, `npm run dev` starts esbuild in watch mode; re-run `install-
 3. In Obsidian, select some Markdown and run the command **"Send selection to Anki"**
    (bind a hotkey in *Settings → Hotkeys*).
 
+Selecting part of a table works: pick a few rows and the plugin puts the table's header and
+delimiter rows back before sending, so Anki gets a table rather than a paragraph of `|`.
+Rows the selection only half covers are widened to the whole row.
+
 The bridge discovery file path can be overridden in the plugin's settings tab.
