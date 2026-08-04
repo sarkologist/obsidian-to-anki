@@ -62,33 +62,34 @@ function isDelimiter(line: string | undefined): boolean {
   return cells.every((cell) => /^\s*:?-+:?\s*$/.test(cell));
 }
 
-interface TableHead {
+interface Table {
   headerLine: number;
   delimiterLine: number;
+  lastRowLine: number;
 }
 
 /**
- * The header/delimiter pair of the table containing `line`, or null if it isn't in one.
- * Walks upward across row-ish lines; a blank line or ordinary prose ends the table and
- * stops the search.
+ * The table containing `line`, or null if it isn't in one. A table is a contiguous run of
+ * row-ish lines — a blank line or ordinary prose ends it — whose first two lines are the
+ * header and its delimiter. Finding the run's top rather than stopping at the first
+ * delimiter-looking line above matters: a body row of literal dashes (`| --- | --- |`) is
+ * itself delimiter-shaped, and stopping there would take the row above it as the header.
  */
-function findTableHead(editor: EditorLines, line: number): TableHead | null {
-  if (line < 0 || line > editor.lastLine()) return null;
+function findTable(editor: EditorLines, line: number): Table | null {
+  const lastLine = editor.lastLine();
+  if (line < 0 || line > lastLine || !isRow(editor.getLine(line))) return null;
 
-  // `line` is itself the header (the delimiter is directly below it).
-  if (isRow(editor.getLine(line)) && line < editor.lastLine() && isDelimiter(editor.getLine(line + 1))) {
-    return { headerLine: line, delimiterLine: line + 1 };
-  }
+  let headerLine = line;
+  while (headerLine > 0 && isRow(editor.getLine(headerLine - 1))) headerLine -= 1;
 
-  let i = line;
-  while (i >= 0 && isRow(editor.getLine(i)) && !isDelimiter(editor.getLine(i))) i -= 1;
-  if (i < 0 || !isDelimiter(editor.getLine(i))) return null;
+  const delimiterLine = headerLine + 1;
+  if (delimiterLine > lastLine) return null;
+  if (isDelimiter(editor.getLine(headerLine)) || !isDelimiter(editor.getLine(delimiterLine))) return null;
 
-  const headerLine = i - 1;
-  if (headerLine < 0 || !isRow(editor.getLine(headerLine)) || isDelimiter(editor.getLine(headerLine))) {
-    return null;
-  }
-  return { headerLine, delimiterLine: i };
+  let lastRowLine = delimiterLine;
+  while (lastRowLine < lastLine && isRow(editor.getLine(lastRowLine + 1))) lastRowLine += 1;
+
+  return { headerLine, delimiterLine, lastRowLine };
 }
 
 /**
@@ -111,23 +112,23 @@ function lastSelectedLine(editor: EditorLines, from: Pos, to: Pos): Pos {
  * below them. A selection that isn't in a table is returned untouched.
  */
 export function selectionMarkdown(editor: EditorLines, from: Pos, to: Pos): string {
-  const table = findTableHead(editor, from.line);
+  const table = findTable(editor, from.line);
   if (!table) return editor.getRange(from, to);
 
+  // The start is inside the table by construction, so it always widens. The end may have
+  // run out the bottom of it, and widening an unrelated line would send prose the user
+  // never selected — so only widen while still in the table.
   const end = lastSelectedLine(editor, from, to);
-  const start: Pos = { line: from.line, ch: isRow(editor.getLine(from.line)) ? 0 : from.ch };
-  const stop: Pos = isRow(editor.getLine(end.line))
-    ? { line: end.line, ch: editor.getLine(end.line).length }
-    : end;
+  const start: Pos = { line: from.line, ch: 0 };
+  const stop: Pos =
+    end.line <= table.lastRowLine ? { line: end.line, ch: editor.getLine(end.line).length } : end;
   const body = editor.getRange(start, stop);
 
-  // Prepend only what the selection is missing: both rows when it starts in the table body,
-  // just the header when it starts on the delimiter, nothing when it starts at the header.
-  if (start.line > table.delimiterLine) {
-    return `${editor.getLine(table.headerLine)}\n${editor.getLine(table.delimiterLine)}\n${body}`;
-  }
-  if (start.line === table.delimiterLine) {
-    return `${editor.getLine(table.headerLine)}\n${body}`;
-  }
+  const header = editor.getLine(table.headerLine);
+  const delimiter = editor.getLine(table.delimiterLine);
+  // Supply whichever of the two the selected range is missing.
+  if (start.line > table.delimiterLine) return `${header}\n${delimiter}\n${body}`;
+  if (start.line === table.delimiterLine) return `${header}\n${body}`;
+  if (end.line < table.delimiterLine) return `${body}\n${delimiter}`; // the header row alone
   return body;
 }
